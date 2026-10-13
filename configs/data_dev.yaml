@@ -1,0 +1,33 @@
+# Dev data tier: 2 training shards (train), 1 validation shard (val), 1 validation shard (test).
+# Design doc: §5 window, §6 frame, §8 neighbors, §9 map, §10 splits/tiers, §13 configuration.
+seed: 42
+
+data:
+  dataset_version: v1.3.1
+  raw_root: data/raw/womd_v1_3_1
+  cache_root: data/cache
+  sample_hz: 10
+  scene_num_frames: 91
+  max_timestep_error_s: 0.01  # skip scenes whose frames are not dt apart within the window
+  current_index: 20
+  train_current_indices: [20]
+  history_seconds: 2.0
+  future_seconds: 6.0
+  target_types: [pedestrian, cyclist]
+  min_history_valid_fraction: 0.9
+  min_future_valid_fraction: 0.9
+  require_final_future_valid: true
+  frame_heading_source: auto
+  velocity_heading_min_speed_mps: 0.5
+  max_neighbors: 48  # 16 dropped 34% of approaching vehicles; 48 drops 3% (design doc §8)
+  neighbor_radius_m: 50.0
+  always_include_sdc: true
+  map_radius_m: 50.0
+  map_resample_spacing_m: 1.0
+  max_map_polylines: 256  # 128 dropped 4.5% of chunks along cyclists' paths; 256 drops 0.7% (doc §9)
+  max_points_per_polyline: 20
+  map_dtype: float32
+  splits:
+    train: {source: training, shards: [0, 1]}
+    val: {source: validation, shards: [0]}
+    test: {source: validation, shards: [75]}

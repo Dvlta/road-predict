@@ -1,0 +1,10 @@
+# Constant-velocity baseline (design doc §16). Point data_config at another tier to switch data.
+seed: 42
+data_config: data_dev.yaml
+
+model:
+  name: constant_velocity
+
+evaluation:
+  miss_threshold_m: 2.0
+  stationary_speed_threshold_mps: 0.5
