@@ -1,13 +1,20 @@
 """Config loading, validation and fingerprints."""
 
 import copy
+import dataclasses
 
 import pytest
 import yaml
 from conftest import DEV_CONFIG
 
 from prs.data import PREPROCESS_VERSION
-from prs.utils.config import ConfigError, data_config_from_dict, load_config
+from prs.utils.config import (
+    ConfigError,
+    config_from_dict,
+    config_to_dict,
+    data_config_from_dict,
+    load_config,
+)
 from prs.utils.fingerprint import data_fingerprint
 
 
@@ -131,3 +138,41 @@ def test_data_config_override_sets_tier():
     exp = load_config(model_config, data_config=DEV_CONFIG.parent / "data_exp.yaml")
     assert exp.tier == "data_exp" and len(exp.data.splits["test"].shards) == 30
     assert exp.require_model().name == "constant_velocity"
+
+
+def test_lstm_config_loads():
+    cfg = load_config(DEV_CONFIG.parent / "lstm.yaml")
+    model, training = cfg.require_model(), cfg.require_training()
+    assert (model.name, model.hidden_dim, model.num_layers, model.decoder_hidden_dim) == (
+        "lstm", 256, 2, 512,
+    )  # fmt: skip
+    assert (training.batch_size, training.epochs, cfg.device) == (64, 30, "auto")
+
+
+def test_model_section_needs_exactly_its_hyperparameters(tmp_path, raw_data):
+    path = tmp_path / "model.yaml"
+    path.write_text(yaml.safe_dump({"data": raw_data, "model": {"name": "lstm", "hidden_dim": 8}}))
+    with pytest.raises(ConfigError, match="model.num_layers is required"):
+        load_config(path)
+    path.write_text(
+        yaml.safe_dump({"data": raw_data, "model": {"name": "constant_velocity", "dropout": 0.1}})
+    )
+    with pytest.raises(ConfigError, match="model.dropout is not used"):
+        load_config(path)
+
+
+def test_config_rejects_unknown_device(tmp_path, raw_data):
+    path = tmp_path / "device.yaml"
+    path.write_text(yaml.safe_dump({"data": raw_data, "device": "tpu"}))
+    with pytest.raises(ConfigError, match="device must be one of"):
+        load_config(path)
+
+
+def test_config_to_dict_round_trips():
+    cfg = load_config(
+        DEV_CONFIG.parent / "lstm.yaml", data_config=DEV_CONFIG.parent / "data_exp.yaml"
+    )
+    plain = config_to_dict(cfg)
+    assert yaml.safe_load(yaml.safe_dump(plain)) == plain  # YAML-safe types only
+    assert config_from_dict(plain) == dataclasses.replace(cfg, data_source=None)
+    assert plain["data"]["splits"]["train"]["shards"] == list(range(100))

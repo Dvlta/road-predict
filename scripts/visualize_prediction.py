@@ -3,6 +3,8 @@
     uv run python scripts/visualize_prediction.py --config configs/baseline_cv.yaml --examples 2
     uv run python scripts/visualize_prediction.py --config configs/baseline_cv.yaml \
         --scenario-id <id> --target-track-id <id>
+    uv run python scripts/visualize_prediction.py --config configs/lstm.yaml \
+        --checkpoint outputs/runs/<run>/best.pt --examples 2
 """
 
 from __future__ import annotations
@@ -12,13 +14,16 @@ from pathlib import Path
 
 import torch
 
+from prs.data import PREPROCESS_VERSION
 from prs.data.collate import collate_samples
 from prs.data.preprocess import find_sample, pick_examples
 from prs.data.types import ObjectType
 from prs.metrics.breakdowns import per_sample_metrics
-from prs.models import build_model
+from prs.models import build_model, is_learned
 from prs.models.base import model_inputs
-from prs.utils.config import SPLIT_NAMES, load_config
+from prs.training.checkpoint import load_checkpoint, restore_model
+from prs.utils.config import SPLIT_NAMES, config_to_dict, load_config
+from prs.utils.fingerprint import data_fingerprint
 from prs.visualization.predictions import render_sample
 
 
@@ -31,6 +36,7 @@ def main() -> None:
     parser.add_argument("--examples", type=int, default=2, help="targets per VRU type")
     parser.add_argument("--min-speed", type=float, default=0.0, help="m/s, examples mode only")
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/figures/predictions"))
+    parser.add_argument("--checkpoint", type=Path, help="weights for a learned model")
     args = parser.parse_args()
     if (args.scenario_id is None) != (args.target_track_id is None):
         parser.error("--scenario-id and --target-track-id must be given together")
@@ -38,6 +44,13 @@ def main() -> None:
     cfg = load_config(args.config)
     model_cfg = cfg.require_model()
     model = build_model(model_cfg, cfg.data).eval()
+    if is_learned(model):
+        if args.checkpoint is None:
+            parser.error(f"model {model_cfg.name!r} is learned: pass --checkpoint")
+        fingerprint = data_fingerprint(cfg.data, PREPROCESS_VERSION)
+        restore_model(
+            model, load_checkpoint(args.checkpoint), config_to_dict(cfg)["model"], fingerprint
+        )
     if args.scenario_id is not None:
         examples = [find_sample(cfg.data, args.split, args.scenario_id, args.target_track_id)]
     else:

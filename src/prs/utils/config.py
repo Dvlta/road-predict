@@ -17,7 +17,13 @@ from prs.data.types import OBJECT_TYPE_BY_NAME
 
 FRAME_HEADING_SOURCES = ("box", "velocity", "auto")
 MAP_DTYPES = ("float32", "float16")
-MODEL_NAMES = ("constant_velocity",)
+MODEL_NAMES = ("constant_velocity", "lstm")
+# Hyperparameters each model requires in its `model` section; every other one must be absent.
+MODEL_PARAMS: dict[str, tuple[str, ...]] = {
+    "constant_velocity": (),
+    "lstm": ("hidden_dim", "num_layers", "dropout", "decoder_hidden_dim"),
+}
+DEVICES = ("auto", "cuda", "mps", "cpu")
 SPLIT_NAMES = ("train", "val", "test")
 # Official source split each project split must come from (design doc §10.2).
 SPLIT_SOURCES = {"train": "training", "val": "validation", "test": "validation"}
@@ -148,9 +154,46 @@ class DataConfig:
 @dataclass(frozen=True)
 class ModelConfig:
     name: str
+    hidden_dim: int | None = None
+    num_layers: int | None = None
+    dropout: float | None = None
+    decoder_hidden_dim: int | None = None
 
     def __post_init__(self) -> None:
         _require(self.name in MODEL_NAMES, f"model.name must be one of {MODEL_NAMES}")
+        required = MODEL_PARAMS[self.name]
+        for f in fields(self)[1:]:
+            given = getattr(self, f.name) is not None
+            _require(
+                given == (f.name in required),
+                f"model.{f.name} is "
+                + ("required" if not given else "not used")
+                + f" by model {self.name!r}",
+            )
+        for name in ("hidden_dim", "num_layers", "decoder_hidden_dim"):
+            value = getattr(self, name)
+            _require(value is None or value > 0, f"model.{name} must be positive")
+        _require(
+            self.dropout is None or 0.0 <= self.dropout < 1.0, "model.dropout must be in [0, 1)"
+        )
+
+
+@dataclass(frozen=True)
+class TrainingConfig:
+    batch_size: int
+    epochs: int
+    learning_rate: float
+    weight_decay: float
+    gradient_clip_norm: float
+    smooth_l1_beta: float
+    num_workers: int
+
+    def __post_init__(self) -> None:
+        for name in ("batch_size", "epochs", "learning_rate", "gradient_clip_norm"):
+            _require(getattr(self, name) > 0, f"training.{name} must be positive")
+        _require(self.weight_decay >= 0, "training.weight_decay must be >= 0")
+        _require(self.smooth_l1_beta > 0, "training.smooth_l1_beta must be positive")
+        _require(self.num_workers >= 0, "training.num_workers must be >= 0")
 
 
 @dataclass(frozen=True)
@@ -170,9 +213,14 @@ class EvaluationConfig:
 class Config:
     data: DataConfig
     seed: int = 42
+    device: str = "auto"  # auto = cuda, then mps, then cpu (design doc §30)
     model: ModelConfig | None = None
+    training: TrainingConfig | None = None
     evaluation: EvaluationConfig | None = None
     data_source: Path | None = None  # file the `data` section came from (names the data tier)
+
+    def __post_init__(self) -> None:
+        _require(self.device in DEVICES, f"device must be one of {DEVICES}")
 
     @property
     def tier(self) -> str:
@@ -183,6 +231,11 @@ class Config:
         if self.model is None:
             raise ConfigError("config has no `model` section")
         return self.model
+
+    def require_training(self) -> TrainingConfig:
+        if self.training is None:
+            raise ConfigError("config has no `training` section")
+        return self.training
 
     def require_evaluation(self) -> EvaluationConfig:
         if self.evaluation is None:
@@ -213,12 +266,27 @@ def load_config(path: str | Path, data_config: str | Path | None = None) -> Conf
 
 
 def config_from_dict(raw: dict[str, Any]) -> Config:
-    allowed = {"data", "seed", "model", "evaluation"}
+    allowed = {"data", "seed", "device", "model", "training", "evaluation"}
     _check_keys(raw, allowed, required={"data"}, where="config")
     return Config(
         data=data_config_from_dict(raw["data"]),
         seed=_as_int(raw.get("seed", 42), "seed"),
-        model=_section(raw, "model", ModelConfig, {"name": _as_str}),
+        device=_as_str(raw.get("device", "auto"), "device"),
+        model=_model_section(raw),
+        training=_section(
+            raw,
+            "training",
+            TrainingConfig,
+            {
+                "batch_size": _as_int,
+                "epochs": _as_int,
+                "learning_rate": _as_float,
+                "weight_decay": _as_float,
+                "gradient_clip_norm": _as_float,
+                "smooth_l1_beta": _as_float,
+                "num_workers": _as_int,
+            },
+        ),
         evaluation=_section(
             raw,
             "evaluation",
@@ -226,6 +294,50 @@ def config_from_dict(raw: dict[str, Any]) -> Config:
             {"miss_threshold_m": _as_float, "stationary_speed_threshold_mps": _as_float},
         ),
     )
+
+
+def config_to_dict(cfg: Config) -> dict[str, Any]:
+    """The resolved config as plain YAML/JSON types; `config_from_dict` reads it back
+    unchanged. Saved with every training run and checkpoint (design doc §25, §32)."""
+
+    def plain(value: Any) -> Any:
+        if isinstance(value, Path):
+            return str(value)
+        if isinstance(value, tuple):
+            return [plain(v) for v in value]
+        if isinstance(value, SplitSpec):
+            return {"source": value.source, "shards": list(value.shards)}
+        if isinstance(value, dict):
+            return {k: plain(v) for k, v in value.items()}
+        return value
+
+    def section(obj: Any) -> dict[str, Any]:
+        items = {f.name: getattr(obj, f.name) for f in fields(obj)}
+        return {k: plain(v) for k, v in items.items() if v is not None}
+
+    out: dict[str, Any] = {"seed": cfg.seed, "device": cfg.device, "data": section(cfg.data)}
+    for name in ("model", "training", "evaluation"):
+        if getattr(cfg, name) is not None:
+            out[name] = section(getattr(cfg, name))
+    return out
+
+
+def _model_section(raw: dict[str, Any]) -> ModelConfig | None:
+    """The `model` section: `name` plus exactly the hyperparameters that model uses."""
+    if "model" not in raw:
+        return None
+    section = raw["model"]
+    if not isinstance(section, dict):
+        raise ConfigError("model: expected a mapping")
+    converters: dict[str, Callable[[Any, str], Any]] = {
+        "name": _as_str,
+        "hidden_dim": _as_int,
+        "num_layers": _as_int,
+        "dropout": _as_float,
+        "decoder_hidden_dim": _as_int,
+    }
+    _check_keys(section, set(converters), required={"name"}, where="model")
+    return ModelConfig(**{key: converters[key](v, f"model.{key}") for key, v in section.items()})
 
 
 def _load_mapping(path: Path) -> dict[str, Any]:

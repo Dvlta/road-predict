@@ -70,6 +70,24 @@ def summarize(
     return summary
 
 
+def group_masks(
+    target_types: np.ndarray,
+    current_speeds: np.ndarray,
+    class_names: Sequence[str],
+    stationary_speed_threshold_mps: float,
+) -> dict[str, np.ndarray]:
+    """One boolean sample mask per reporting group, in table order: overall, then each class
+    followed by its speed buckets ("pedestrian", "pedestrian/stationary", ...)."""
+    moving = np.asarray(current_speeds) >= stationary_speed_threshold_mps
+    masks = {"overall": np.ones(len(moving), dtype=bool)}
+    for name in class_names:
+        is_class = np.asarray(target_types) == OBJECT_TYPE_BY_NAME[name]
+        masks[name] = is_class
+        masks[f"{name}/stationary"] = is_class & ~moving
+        masks[f"{name}/moving"] = is_class & moving
+    return masks
+
+
 def breakdown(
     per_sample: dict[str, np.ndarray],
     target_types: np.ndarray,
@@ -80,21 +98,17 @@ def breakdown(
     clusters: np.ndarray | None = None,
 ) -> dict:
     """Overall, per-class and per-class x speed-bucket summaries, each with its sample count."""
-    moving = np.asarray(current_speeds) >= eval_cfg.stationary_speed_threshold_mps
-
-    def summary(mask: np.ndarray) -> dict[str, float | int | None]:
-        return summarize(per_sample, mask, eval_cfg.miss_threshold_m, num_modes, clusters)
-
-    result: dict = {
-        "overall": summary(np.ones(len(moving), dtype=bool)),
-        "by_class": {},
-        "by_class_and_speed": {},
-    }
-    for name in class_names:
-        is_class = np.asarray(target_types) == OBJECT_TYPE_BY_NAME[name]
-        result["by_class"][name] = summary(is_class)
-        for bucket, in_bucket in (("stationary", ~moving), ("moving", moving)):
-            result["by_class_and_speed"][f"{name}/{bucket}"] = summary(is_class & in_bucket)
+    masks = group_masks(
+        target_types, current_speeds, class_names, eval_cfg.stationary_speed_threshold_mps
+    )
+    result: dict = {"by_class": {}, "by_class_and_speed": {}}
+    for group, mask in masks.items():
+        summary = summarize(per_sample, mask, eval_cfg.miss_threshold_m, num_modes, clusters)
+        if group == "overall":
+            result["overall"] = summary
+        else:
+            result["by_class_and_speed" if "/" in group else "by_class"][group] = summary
+    result = {"overall": result["overall"], **result}
     first = per_sample["first_step_error"]
     result["sanity"] = {
         "first_step_error_mean_m": float(np.nanmean(first)),

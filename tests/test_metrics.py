@@ -7,9 +7,16 @@ import numpy as np
 import pytest
 
 from prs.data.types import SampleMeta
-from prs.metrics.breakdowns import breakdown, clustered_ci95, per_sample_metrics, summarize
+from prs.metrics.breakdowns import (
+    breakdown,
+    clustered_ci95,
+    group_masks,
+    per_sample_metrics,
+    summarize,
+)
 from prs.metrics.displacement import ade, displacement_errors, fde
 from prs.metrics.manifest import manifest_hash, save_manifest
+from prs.metrics.paired import align, paired_comparison, paired_table
 from prs.metrics.tables import ManifestMismatchError, breakdown_table, main_table
 from prs.utils.config import EvaluationConfig
 
@@ -182,3 +189,49 @@ def test_results_tables():
 def test_results_tables_refuse_different_sample_sets():
     with pytest.raises(ManifestMismatchError, match="different sample sets"):
         main_table([_report("a", "abc"), _report("b", "def")])
+
+
+def _per_sample(n: int = 40, seed: int = 0) -> dict[str, np.ndarray]:
+    rng = np.random.default_rng(seed)
+    fde_values = rng.uniform(0.5, 4.0, n)
+    return {
+        "keys": np.array([f"s/{i // 2}/{i}/20" for i in range(n)]),
+        "ade": fde_values / 2,
+        "fde": fde_values,
+        "min_ade": fde_values / 2,
+        "min_fde": fde_values,
+    }
+
+
+def test_group_masks_order_and_buckets():
+    masks = group_masks(
+        np.array([2, 2, 3]), np.array([0.1, 1.0, 3.0]), ["pedestrian", "cyclist"], 0.5
+    )
+    assert list(masks) == ["overall", "pedestrian", "pedestrian/stationary", "pedestrian/moving",
+                           "cyclist", "cyclist/stationary", "cyclist/moving"]  # fmt: skip
+    assert masks["pedestrian/stationary"].tolist() == [True, False, False]
+    assert masks["cyclist/moving"].tolist() == [False, False, True]
+
+
+def test_paired_comparison_of_a_uniformly_better_model():
+    a = _per_sample()
+    b = {**a, "ade": a["ade"] - 0.25, "fde": a["fde"] - 0.5, "min_fde": a["fde"] - 0.5}
+    clusters = np.array([key.split("/")[1] for key in a["keys"]])
+    masks = {"overall": np.ones(40, dtype=bool)}
+    result = paired_comparison(a, b, masks, clusters, miss_threshold_m=2.0)["overall"]
+    assert result["count"] == 40
+    assert result["fde"]["diff"] == pytest.approx(-0.5)
+    assert result["fde"]["diff_ci95"] == pytest.approx(0.0, abs=1e-12)  # identical shift
+    assert result["miss_rate"]["diff"] <= 0
+    assert "*" in paired_table({"overall": result}, "A", "B")
+
+
+def test_align_reorders_and_refuses_different_samples():
+    a = _per_sample()
+    order = np.random.default_rng(1).permutation(40)
+    b = {name: values[order] for name, values in a.items()}
+    aligned = align(a, b)
+    np.testing.assert_array_equal(aligned["keys"], a["keys"])
+    np.testing.assert_array_equal(aligned["fde"], a["fde"])
+    with pytest.raises(ValueError, match="different sample sets"):
+        align(a, {name: values[:-1] for name, values in a.items()})
