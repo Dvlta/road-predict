@@ -1,6 +1,7 @@
-# WOMD data and experiment outputs: never commit (WOMD license)
-data/
-outputs/
+# WOMD data and experiment outputs: never commit (WOMD license). Anchored to the repo root so
+# they do not also match the src/prs/data package.
+/data/
+/outputs/
 
 # Python
 __pycache__/
