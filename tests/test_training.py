@@ -150,11 +150,14 @@ def test_checkpoint_mismatch_fails_loudly(tmp_path):
 
 @pytest.mark.slow
 @pytest.mark.data
-def test_overfit_tiny(tmp_path):
-    """Check 5: the full-size LSTM memorizes 100 real training samples (dev cache). Full-batch
-    steps at a raised learning rate, without dropout, keep this to about a minute on the CPU."""
+# Full-batch steps per model: about twice the steps needed to first reach 0.1 m on the CPU (≈ 200
+# for lstm_map, whose map encoder makes each step ≈ 0.7 s).
+@pytest.mark.parametrize(("config_name", "steps"), [("lstm.yaml", 1000), ("lstm_map.yaml", 400)])
+def test_overfit_tiny(tmp_path, config_name, steps):
+    """Check 5: each full-size learned model memorizes 100 real training samples (dev cache).
+    Full-batch steps at a raised learning rate, without dropout, keep this short on the CPU."""
     cfg = _cfg(batch_size=100, learning_rate=3e-3)
-    full_size = load_config(REPO_ROOT / "configs" / "lstm.yaml").require_model()
+    full_size = load_config(REPO_ROOT / "configs" / config_name).require_model()
     cfg = dataclasses.replace(cfg, model=dataclasses.replace(full_size, dropout=0.0))
     if not cache_dir(cfg.data).exists():
         pytest.skip("dev cache not built")
@@ -163,5 +166,5 @@ def test_overfit_tiny(tmp_path):
     subset = Subset(CachedDataset(cfg.data, "train", fields=fields), range(100))
     fingerprint = data_fingerprint(cfg.data, PREPROCESS_VERSION)
     trainer = _trainer(cfg, tmp_path, subset, fingerprint=fingerprint)
-    best = trainer.fit(1000)
+    best = trainer.fit(steps)
     assert best["val_ade"] < 0.1, best

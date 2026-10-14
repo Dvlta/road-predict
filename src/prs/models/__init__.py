@@ -2,10 +2,12 @@
 
 from __future__ import annotations
 
-from prs.data.types import F_AGENT
+from prs.data.map_types import NUM_MAP_TYPES
+from prs.data.types import F_AGENT, F_MAP
 from prs.models.base import ForecastModel
 from prs.models.constant_velocity import ConstantVelocity
 from prs.models.lstm_forecaster import LSTMForecaster
+from prs.models.lstm_map_forecaster import LSTMMapForecaster
 from prs.utils.config import DataConfig, ModelConfig
 
 
@@ -20,6 +22,19 @@ def build_model(model_cfg: ModelConfig, data_cfg: DataConfig) -> ForecastModel:
             num_layers=model_cfg.num_layers,
             dropout=model_cfg.dropout,
             decoder_hidden_dim=model_cfg.decoder_hidden_dim,
+        )
+    if model_cfg.name == "lstm_map":
+        return LSTMMapForecaster(
+            agent_features=F_AGENT,
+            map_features=F_MAP,
+            num_map_types=NUM_MAP_TYPES,
+            future_steps=data_cfg.future_steps,
+            hidden_dim=model_cfg.hidden_dim,
+            num_layers=model_cfg.num_layers,
+            dropout=model_cfg.dropout,
+            decoder_hidden_dim=model_cfg.decoder_hidden_dim,
+            map_point_dim=model_cfg.map_point_dim,
+            map_attention_heads=model_cfg.map_attention_heads,
         )
     raise ValueError(f"unknown model {model_cfg.name!r}")
 

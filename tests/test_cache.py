@@ -11,7 +11,7 @@ from conftest import CYCLIST, PED
 
 from prs.data import PREPROCESS_VERSION
 from prs.data.cache import CACHE_FIELDS, CacheError, ShardCache, shard_cache_dir, write_shard_cache
-from prs.data.dataset import CachedDataset, collate_batch
+from prs.data.dataset import CachedDataset, ShuffledMapDataset, collate_batch
 from prs.data.preprocess import build_sample
 from prs.data.splits import shard_paths
 from prs.data.windows import make_window
@@ -109,3 +109,27 @@ def test_dataset_pickles_without_array_data(cfg, samples):
     restored = pickle.loads(pickle.dumps(dataset))
     assert restored.shards[0]._arrays == {}
     np.testing.assert_array_equal(restored[0]["map_polylines"], dataset[0]["map_polylines"])
+
+
+def test_shuffled_map_dataset_swaps_only_the_map():
+    """Check 6 support: every sample gets another sample's map; nothing else changes."""
+
+    class Items:
+        def __len__(self):
+            return 50
+
+        def __getitem__(self, i):
+            return {"index": i, "target_history": np.full(3, i), "map_polylines": np.full(2, i),
+                    "map_valid": np.full(2, i % 2 == 0), "map_types": np.full(2, i)}  # fmt: skip
+
+    shuffled = ShuffledMapDataset(Items(), seed=0)
+    sources = []
+    for i in range(len(shuffled)):
+        item = shuffled[i]
+        assert item["index"] == i and (item["target_history"] == i).all()
+        source = int(item["map_polylines"][0])
+        assert source != i and (item["map_types"] == source).all()
+        assert (item["map_valid"] == (source % 2 == 0)).all()
+        sources.append(source)
+    assert sorted(sources) == list(range(50))  # a permutation: every map used once
+    assert ShuffledMapDataset(Items(), seed=0).map_source.tolist() == shuffled.map_source.tolist()

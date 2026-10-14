@@ -11,6 +11,10 @@ outputs/metrics/<config name>/<data tier>/<split>.json, which records the exact 
 (manifest hash; the key list is saved under outputs/manifests/), the data fingerprint, the git
 commit and the checkpoint, so results are reproducible. Per-sample errors go to
 <split>.per_sample.npz beside it, for paired comparisons (scripts/compare_models.py).
+
+--shuffle-map SEED gives every sample another sample's map (design doc §14.3 check 6) and writes
+<split>_shuffled_map.json instead; compare it with the normal file to see how much the model
+relies on the map.
 """
 
 from __future__ import annotations
@@ -23,7 +27,7 @@ import numpy as np
 from torch.utils.data import DataLoader
 
 from prs.data import PREPROCESS_VERSION
-from prs.data.dataset import LABEL_FIELDS, CachedDataset, collate_batch
+from prs.data.dataset import LABEL_FIELDS, CachedDataset, ShuffledMapDataset, collate_batch
 from prs.data.splits import shard_paths
 from prs.metrics.breakdowns import breakdown, per_sample_metrics
 from prs.metrics.manifest import sample_key, save_manifest
@@ -58,6 +62,9 @@ def main() -> None:
     parser.add_argument("--manifest-dir", type=Path, default=Path("outputs/manifests"))
     parser.add_argument("--checkpoint", type=Path, help="weights for a learned model")
     parser.add_argument("--device", choices=DEVICES, help="override the config's device")
+    parser.add_argument(
+        "--shuffle-map", type=int, metavar="SEED", help="evaluate with maps shuffled across samples"
+    )
     args = parser.parse_args()
 
     cfg = load_config(args.config, data_config=args.data_config)
@@ -85,6 +92,12 @@ def main() -> None:
     dataset = CachedDataset(cfg.data, args.split, fields={*model.input_fields, *LABEL_FIELDS})
     if len(dataset) == 0:
         raise SystemExit(f"no samples in split {args.split!r}")
+    stem = args.split
+    if args.shuffle_map is not None:
+        if "map_polylines" not in model.input_fields:
+            raise SystemExit(f"model {model_cfg.name!r} does not read the map; drop --shuffle-map")
+        dataset = ShuffledMapDataset(dataset, args.shuffle_map)
+        stem = f"{args.split}_shuffled_map"
     loader = DataLoader(dataset, batch_size=args.batch_size, collate_fn=collate_batch)
     results = predict(model, loader, device)
     if not np.array_equal(results["index"], np.arange(len(dataset))):
@@ -107,10 +120,12 @@ def main() -> None:
         clusters=scenes,
     )
     shards = [p.name for p in shard_paths(cfg.data, args.split)]
-    out = args.out_dir / args.config.stem / cfg.tier / f"{args.split}.json"
-    per_sample_path = out.with_name(f"{args.split}.per_sample.npz")
+    out = args.out_dir / args.config.stem / cfg.tier / f"{stem}.json"
+    per_sample_path = out.with_name(f"{stem}.per_sample.npz")
+    shuffled = args.shuffle_map is not None
     report = {
-        "model": model_cfg.name,
+        "model": model_cfg.name + (" (shuffled map)" if shuffled else ""),
+        "map_shuffle_seed": args.shuffle_map,
         "model_info": {
             "uses_map": "map_polylines" in model.input_fields,
             "uses_neighbors": "neighbors" in model.input_fields,

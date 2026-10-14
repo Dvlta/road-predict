@@ -17,12 +17,16 @@ from prs.data.types import OBJECT_TYPE_BY_NAME
 
 FRAME_HEADING_SOURCES = ("box", "velocity", "auto")
 MAP_DTYPES = ("float32", "float16")
-MODEL_NAMES = ("constant_velocity", "lstm")
+MODEL_NAMES = ("constant_velocity", "lstm", "lstm_map")
 # Hyperparameters each model requires in its `model` section; every other one must be absent.
 MODEL_PARAMS: dict[str, tuple[str, ...]] = {
     "constant_velocity": (),
     "lstm": ("hidden_dim", "num_layers", "dropout", "decoder_hidden_dim"),
-}
+    "lstm_map": (
+        "hidden_dim", "num_layers", "dropout", "decoder_hidden_dim",
+        "map_point_dim", "map_attention_heads",
+    ),
+}  # fmt: skip
 DEVICES = ("auto", "cuda", "mps", "cpu")
 SPLIT_NAMES = ("train", "val", "test")
 # Official source split each project split must come from (design doc §10.2).
@@ -158,6 +162,8 @@ class ModelConfig:
     num_layers: int | None = None
     dropout: float | None = None
     decoder_hidden_dim: int | None = None
+    map_point_dim: int | None = None  # point-MLP width: 4 -> map_point_dim / 2 -> map_point_dim
+    map_attention_heads: int | None = None
 
     def __post_init__(self) -> None:
         _require(self.name in MODEL_NAMES, f"model.name must be one of {MODEL_NAMES}")
@@ -170,11 +176,21 @@ class ModelConfig:
                 + ("required" if not given else "not used")
                 + f" by model {self.name!r}",
             )
-        for name in ("hidden_dim", "num_layers", "decoder_hidden_dim"):
+        for name in (
+            "hidden_dim", "num_layers", "decoder_hidden_dim", "map_point_dim", "map_attention_heads"
+        ):  # fmt: skip
             value = getattr(self, name)
             _require(value is None or value > 0, f"model.{name} must be positive")
         _require(
             self.dropout is None or 0.0 <= self.dropout < 1.0, "model.dropout must be in [0, 1)"
+        )
+        _require(
+            self.map_point_dim is None or self.map_point_dim % 2 == 0,
+            "model.map_point_dim must be even",
+        )
+        _require(
+            self.map_attention_heads is None or self.hidden_dim % self.map_attention_heads == 0,
+            "model.hidden_dim must be divisible by model.map_attention_heads",
         )
 
 
@@ -335,6 +351,8 @@ def _model_section(raw: dict[str, Any]) -> ModelConfig | None:
         "num_layers": _as_int,
         "dropout": _as_float,
         "decoder_hidden_dim": _as_int,
+        "map_point_dim": _as_int,
+        "map_attention_heads": _as_int,
     }
     _check_keys(section, set(converters), required={"name"}, where="model")
     return ModelConfig(**{key: converters[key](v, f"model.{key}") for key, v in section.items()})

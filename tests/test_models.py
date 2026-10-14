@@ -8,15 +8,18 @@ import pytest
 import torch
 from conftest import REPO_ROOT
 
+from prs.data.map_types import NUM_MAP_TYPES, MapType
 from prs.data.types import F_AGENT
 from prs.models import build_model
 from prs.models.base import MODEL_INPUT_FIELDS, ForecastModel, model_inputs
 from prs.models.constant_velocity import ConstantVelocity
 from prs.models.lstm_forecaster import LSTMForecaster
+from prs.models.lstm_map_forecaster import LSTMMapForecaster
 from prs.utils.config import MODEL_NAMES, load_config
 
-ALL_MODELS = (ForecastModel, ConstantVelocity, LSTMForecaster)
-MODEL_CONFIGS = ("baseline_cv.yaml", "lstm.yaml")
+ALL_MODELS = (ForecastModel, ConstantVelocity, LSTMForecaster, LSTMMapForecaster)
+MODEL_CONFIGS = ("baseline_cv.yaml", "lstm.yaml", "lstm_map.yaml")
+LEARNED_CONFIGS = ("lstm.yaml", "lstm_map.yaml")
 H, T, N, M, P = 21, 60, 4, 6, 20
 
 
@@ -58,6 +61,10 @@ def _batch(batch_size: int = 5, seed: int = 0) -> dict[str, np.ndarray]:
     history = rng.normal(size=(batch_size, H, F_AGENT)).astype(np.float32)
     history[..., 8] = history_valid
     history[~history_valid] = 0.0
+    map_valid = rng.random((batch_size, M, P)) > 0.3
+    map_valid[:, -2:] = False  # two padded chunks per sample
+    map_types = rng.integers(1, NUM_MAP_TYPES, size=(batch_size, M))
+    map_types[~map_valid.any(axis=-1)] = MapType.PAD
     return {
         "target_history": history,
         "target_history_valid": history_valid,
@@ -67,8 +74,8 @@ def _batch(batch_size: int = 5, seed: int = 0) -> dict[str, np.ndarray]:
         "neighbor_types": np.ones((batch_size, N), np.int64),
         "neighbor_is_sdc": np.zeros((batch_size, N), bool),
         "map_polylines": rng.normal(size=(batch_size, M, P, 4)).astype(np.float32),
-        "map_valid": rng.random((batch_size, M, P)) > 0.3,
-        "map_types": np.ones((batch_size, M), np.int64),
+        "map_valid": map_valid,
+        "map_types": map_types,
         "target_future": rng.normal(size=(batch_size, T, 2)).astype(np.float32),
         "target_future_valid": np.ones((batch_size, T), bool),
         "ego_future": rng.normal(size=(batch_size, T, 5)).astype(np.float32),
@@ -121,7 +128,36 @@ def test_padding_invariance(config_name):
     for field, mask in masks.items():
         padded = ~batch[mask]
         noisy[field][padded] = rng.normal(scale=50.0, size=noisy[field][padded].shape)
+    padded_chunks = ~batch["map_valid"].any(axis=-1)
+    noisy["map_types"][padded_chunks] = rng.integers(0, NUM_MAP_TYPES, size=padded_chunks.sum())
     np.testing.assert_array_equal(_predict(model, batch), _predict(model, noisy))
+
+
+@pytest.mark.parametrize("config_name", MODEL_CONFIGS)
+def test_map_reaches_exactly_the_map_models(config_name):
+    """Moving the valid map points changes the output iff the model declares map inputs, so
+    `input_fields` (what the loader reads) matches what the model uses, and the map-disabled
+    ablation (`lstm`) really ignores the map."""
+    model, batch = _model(config_name), _batch()
+    moved = {**batch, "map_polylines": batch["map_polylines"] + 3.0}
+    changed = not np.array_equal(_predict(model, batch), _predict(model, moved))
+    assert changed == ("map_polylines" in model.input_fields)
+
+
+@pytest.mark.parametrize("config_name", LEARNED_CONFIGS)
+def test_zero_map_chunks_give_finite_outputs_and_gradients(config_name):
+    """Check 10 (map part): a sample with no valid map chunk still gets finite outputs and
+    gradients, and its padded map content is ignored."""
+    model, batch = _model(config_name).train(), _batch()
+    empty = {**batch, "map_valid": np.zeros_like(batch["map_valid"]),
+             "map_types": np.zeros_like(batch["map_types"])}  # fmt: skip
+    output = model(**model_inputs(empty))["trajectories"]
+    output.square().mean().backward()
+    assert torch.isfinite(output).all()
+    assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
+    model.eval()
+    other = {**empty, "map_polylines": batch["map_polylines"] * 7.0 + 1.0}
+    np.testing.assert_array_equal(_predict(model, empty), _predict(model, other))
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")

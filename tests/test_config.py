@@ -161,6 +161,26 @@ def test_model_section_needs_exactly_its_hyperparameters(tmp_path, raw_data):
         load_config(path)
 
 
+def test_lstm_map_config_checks_map_settings(tmp_path, raw_data):
+    model = load_config(DEV_CONFIG.parent / "lstm_map.yaml").require_model()
+    assert (model.map_point_dim, model.map_attention_heads) == (128, 8)
+    path = tmp_path / "model.yaml"
+    section = {"name": "lstm_map", "hidden_dim": 256, "num_layers": 2, "dropout": 0.1,
+               "decoder_hidden_dim": 512, "map_point_dim": 128,
+               "map_attention_heads": 6}  # fmt: skip
+    path.write_text(yaml.safe_dump({"data": raw_data, "model": section}))
+    with pytest.raises(ConfigError, match="divisible by model.map_attention_heads"):
+        load_config(path)
+    path.write_text(yaml.safe_dump({"data": raw_data, "model": {**section, "map_point_dim": 127}}))
+    with pytest.raises(ConfigError, match="map_point_dim must be even"):
+        load_config(path)
+    lstm = {"name": "lstm", "hidden_dim": 8, "num_layers": 1, "dropout": 0.0,
+            "decoder_hidden_dim": 8, "map_attention_heads": 2}  # fmt: skip
+    path.write_text(yaml.safe_dump({"data": raw_data, "model": lstm}))
+    with pytest.raises(ConfigError, match="model.map_attention_heads is not used by model 'lstm'"):
+        load_config(path)
+
+
 def test_config_rejects_unknown_device(tmp_path, raw_data):
     path = tmp_path / "device.yaml"
     path.write_text(yaml.safe_dump({"data": raw_data, "device": "tpu"}))

@@ -57,6 +57,34 @@ class CachedDataset(Dataset):
         return {name: dict(sorted(total[name].items())) for name in sorted(total)}
 
 
+MAP_FIELDS = ("map_polylines", "map_valid", "map_types")
+
+
+class ShuffledMapDataset(Dataset):
+    """Each sample with another sample's map (design doc §14.3 check 6). The pairing is a
+    seeded derangement, so no sample keeps its own map; everything else is unchanged."""
+
+    def __init__(self, dataset: Dataset, seed: int) -> None:
+        self.dataset = dataset
+        order = np.random.default_rng(seed).permutation(len(dataset))
+        self.map_source = np.empty(len(dataset), dtype=np.int64)
+        self.map_source[order] = np.roll(order, -1)
+
+    def __len__(self) -> int:
+        return len(self.dataset)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        item = self.dataset[index]
+        donor = self.dataset[int(self.map_source[index])]
+        return {**item, **{name: donor[name] for name in MAP_FIELDS if name in item}}
+
+    def metas(self) -> list[SampleMeta]:
+        return self.dataset.metas()
+
+    def filter_counts(self) -> dict[str, dict[str, int]]:
+        return self.dataset.filter_counts()
+
+
 def collate_batch(items: Sequence[dict[str, Any]]) -> dict[str, torch.Tensor]:
     """DataLoader collate: stack each field into a tensor (leading axis = sample)."""
     return {key: torch.as_tensor(np.stack([item[key] for item in items])) for key in items[0]}
