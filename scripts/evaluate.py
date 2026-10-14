@@ -1,10 +1,13 @@
 """Evaluate a forecaster on one split and write a metrics JSON (design doc §16, §24).
 
     uv run python scripts/evaluate.py --config configs/baseline_cv.yaml --split val
+    uv run python scripts/evaluate.py --config configs/baseline_cv.yaml \
+        --data-config configs/data_exp.yaml --split test
 
 Reads samples from the processed cache (build it with scripts/preprocess_waymo.py). Writes
-outputs/metrics/<config name>/<split>.json, which records the exact sample set (manifest
-hash), the data fingerprint and the git commit, so results are reproducible.
+outputs/metrics/<config name>/<data tier>/<split>.json, which records the exact sample set
+(manifest hash; the key list is saved under outputs/manifests/), the data fingerprint and the
+git commit, so results are reproducible.
 """
 
 from __future__ import annotations
@@ -21,7 +24,8 @@ from prs.data import PREPROCESS_VERSION
 from prs.data.dataset import LABEL_FIELDS, CachedDataset, collate_batch
 from prs.data.splits import shard_paths
 from prs.metrics.breakdowns import breakdown, per_sample_metrics
-from prs.metrics.manifest import manifest_hash, sample_key
+from prs.metrics.manifest import save_manifest
+from prs.metrics.tables import breakdown_table
 from prs.models import build_model
 from prs.models.base import ForecastModel, model_inputs
 from prs.utils.config import SPLIT_NAMES, load_config
@@ -46,38 +50,27 @@ def predict(model: ForecastModel, loader: DataLoader) -> dict[str, np.ndarray]:
 
 
 def print_report(report: dict) -> None:
-    manifest = report["manifest"]
-    print(f"\n{report['model']} · {report['split']} · {manifest['num_samples']} samples · "
-          f"manifest {manifest['sha256']}")  # fmt: skip
-    print(f"{'group':<26}{'count':>7}{'ADE (m)':>10}{'FDE (m)':>10}{'miss rate':>11}")
-    rows = [("overall", report["overall"])]
-    for name, summary in report["by_class"].items():
-        rows.append((name, summary))
-        rows += [
-            (f"  {key}", value)
-            for key, value in report["by_class_and_speed"].items()
-            if key.startswith(f"{name}/")
-        ]
-    for label, s in rows:
-        if s["count"] == 0:
-            print(f"{label:<26}{0:>7}")
-            continue
-        print(f"{label:<26}{s['count']:>7}{s['ade']:>10.2f}{s['fde']:>10.2f}"
-              f"{s['miss_rate']:>11.1%}")  # fmt: skip
-    sanity = report["sanity"]
-    print(f"first-step (+0.1 s) error: mean {sanity['first_step_error_mean_m']:.3f} m, "
-          f"median {sanity['first_step_error_median_m']:.3f} m")  # fmt: skip
+    print(f"\n{report['model']}")
+    print(breakdown_table([report]))
+    sanity, manifest = report["sanity"], report["manifest"]
+    print(
+        f"first-step (+0.1 s) error: mean {sanity['first_step_error_mean_m']:.3f} m, "
+        f"median {sanity['first_step_error_median_m']:.3f} m · "
+        f"{manifest['num_samples']} samples, manifest {manifest['sha256']}"
+    )
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--config", required=True, type=Path)
+    parser.add_argument("--data-config", type=Path, help="override the config's data tier")
     parser.add_argument("--split", default="val", choices=SPLIT_NAMES)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/metrics"))
+    parser.add_argument("--manifest-dir", type=Path, default=Path("outputs/manifests"))
     args = parser.parse_args()
 
-    cfg = load_config(args.config)
+    cfg = load_config(args.config, data_config=args.data_config)
     model_cfg, eval_cfg = cfg.require_model(), cfg.require_evaluation()
     model = build_model(model_cfg, cfg.data).eval()
 
@@ -99,16 +92,29 @@ def main() -> None:
         cfg.data.target_types,
         eval_cfg,
         model.num_modes,
+        clusters=np.array([m.scenario_id for m in metas]),
     )
-    keys = [sample_key(m) for m in metas]
+    shards = [p.name for p in shard_paths(cfg.data, args.split)]
+    fingerprint = data_fingerprint(cfg.data, PREPROCESS_VERSION)
     report = {
         "model": model_cfg.name,
+        "model_info": {
+            "uses_map": "map_polylines" in model.input_fields,
+            "uses_neighbors": "neighbors" in model.input_fields,
+            "num_modes": model.num_modes,
+        },
         "config": str(args.config),
+        "tier": cfg.tier,
         "split": args.split,
-        "shards": [p.name for p in shard_paths(cfg.data, args.split)],
-        "data_fingerprint": data_fingerprint(cfg.data, PREPROCESS_VERSION),
+        "shards": shards,
+        "data_fingerprint": fingerprint,
         "git_commit": git_commit(),
-        "manifest": {"num_samples": len(keys), "sha256": manifest_hash(keys)},
+        "manifest": save_manifest(
+            args.manifest_dir / cfg.tier,
+            metas,
+            args.split,
+            {"tier": cfg.tier, "data_fingerprint": fingerprint, "shards": shards},
+        ),
         "evaluation": {
             "miss_threshold_m": eval_cfg.miss_threshold_m,
             "stationary_speed_threshold_mps": eval_cfg.stationary_speed_threshold_mps,
@@ -116,7 +122,7 @@ def main() -> None:
         **metrics,
         "filter_counts": dataset.filter_counts(),
     }
-    out = args.out_dir / args.config.stem / f"{args.split}.json"
+    out = args.out_dir / args.config.stem / cfg.tier / f"{args.split}.json"
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(json.dumps(report, indent=2))
     print_report(report)

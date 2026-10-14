@@ -1,11 +1,16 @@
-"""Displacement metrics, miss rate, breakdowns and manifests (design doc §16, §21, §27)."""
+"""Displacement metrics, miss rate, breakdowns, intervals, manifests and tables (§16, §21, §24)."""
+
+import json
+from pathlib import Path
 
 import numpy as np
 import pytest
 
-from prs.metrics.breakdowns import breakdown, per_sample_metrics
+from prs.data.types import SampleMeta
+from prs.metrics.breakdowns import breakdown, clustered_ci95, per_sample_metrics, summarize
 from prs.metrics.displacement import ade, displacement_errors, fde
-from prs.metrics.manifest import manifest_hash
+from prs.metrics.manifest import manifest_hash, save_manifest
+from prs.metrics.tables import ManifestMismatchError, breakdown_table, main_table
 from prs.utils.config import EvaluationConfig
 
 T = 60
@@ -109,3 +114,71 @@ def test_manifest_hash_order_independent_and_rejects_duplicates():
     assert manifest_hash(["a", "b"]) != manifest_hash(["a", "c"])
     with pytest.raises(ValueError, match="duplicate"):
         manifest_hash(["a", "a"])
+
+
+def test_clustered_ci_matches_classic_ci_for_independent_samples():
+    rng = np.random.default_rng(0)
+    values = rng.normal(size=200)
+    expected = 1.959964 * values.std(ddof=1) / np.sqrt(len(values))
+    assert clustered_ci95(values, np.arange(200)) == pytest.approx(expected)
+
+
+def test_clustered_ci_does_not_count_duplicates_as_evidence():
+    """Two identical samples from one scene carry no more information than one."""
+    values = np.random.default_rng(1).normal(size=100)
+    once = clustered_ci95(values, np.arange(100))
+    twice = clustered_ci95(np.repeat(values, 2), np.repeat(np.arange(100), 2))
+    naive = clustered_ci95(np.repeat(values, 2), np.arange(200))
+    assert twice == pytest.approx(once) and naive < 0.75 * once
+    assert clustered_ci95(values, np.zeros(100)) is None  # one scene: no interval
+
+
+def test_summarize_adds_intervals_with_clusters():
+    truth = np.stack([_straight()] * 4)
+    per_sample = per_sample_metrics(
+        truth[:, None] + [0.0, 1.0], np.zeros((4, 1)), truth, np.ones((4, T), bool)
+    )
+    summary = summarize(per_sample, np.ones(4, bool), 2.0, 1, clusters=np.array([1, 1, 2, 3]))
+    assert summary["ade"] == pytest.approx(1.0) and summary["ade_ci95"] == pytest.approx(0.0)
+    assert set(summary) == {"count", "ade", "ade_ci95", "fde", "fde_ci95", "miss_rate",
+                            "miss_rate_ci95"}  # fmt: skip
+
+
+def test_save_manifest_is_content_addressed(tmp_path):
+    metas = [_meta("s", "a", 1), _meta("s", "b", 2)]
+    first = save_manifest(tmp_path, metas, "test", {"tier": "x"})
+    again = save_manifest(tmp_path, metas[::-1], "test", {"tier": "x"})
+    assert first == again and first["num_samples"] == 2
+    saved = json.loads(Path(first["path"]).read_text())
+    assert saved["keys"] == ["s/a/1/20", "s/b/2/20"] and saved["sha256"] == first["sha256"]
+
+
+def _meta(shard, scenario_id, track_id):
+    return SampleMeta(shard, scenario_id, track_id, 2, 20, 1.0, 5.0, False, 10.0, "velocity")
+
+
+def _report(model, sha, num_modes=1):
+    summary = {"count": 10, "ade": 1.0, "ade_ci95": 0.1, "fde": 2.0, "fde_ci95": 0.2,
+               "miss_rate": 0.3, "miss_rate_ci95": 0.05}  # fmt: skip
+    if num_modes > 1:
+        summary |= {"min_ade": 0.5, "min_fde": 1.0}
+    return {
+        "model": model, "tier": "data_exp", "split": "test",
+        "manifest": {"sha256": sha, "num_samples": 10},
+        "model_info": {"uses_map": False, "uses_neighbors": False, "num_modes": num_modes},
+        "overall": summary, "by_class": {"pedestrian": summary},
+        "by_class_and_speed": {"pedestrian/moving": summary},
+    }  # fmt: skip
+
+
+def test_results_tables():
+    reports = [_report("constant_velocity", "abc"), _report("multimodal", "abc", num_modes=6)]
+    table = main_table(reports)
+    assert "| constant_velocity | no | no | 1 | 1.00 ± 0.10 | 2.00 ± 0.20 | N/A | N/A |" in table
+    assert "| 0.50 | 1.00 | 30.0% ± 5.0% |" in table
+    assert len(breakdown_table(reports).splitlines()) == 2 + 3 * 2  # header + 3 groups x 2
+
+
+def test_results_tables_refuse_different_sample_sets():
+    with pytest.raises(ManifestMismatchError, match="different sample sets"):
+        main_table([_report("a", "abc"), _report("b", "def")])

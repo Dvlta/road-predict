@@ -11,6 +11,8 @@ from prs.metrics.displacement import ade, displacement_errors, fde, take_mode, t
 from prs.metrics.miss_rate import misses
 from prs.utils.config import EvaluationConfig
 
+Z_95 = 1.959964
+
 
 def per_sample_metrics(
     trajectories: np.ndarray, logits: np.ndarray, future: np.ndarray, future_valid: np.ndarray
@@ -29,21 +31,42 @@ def per_sample_metrics(
     }
 
 
+def clustered_ci95(values: np.ndarray, clusters: np.ndarray) -> float | None:
+    """Half-width of a 95% confidence interval for the mean, robust to correlation within
+    clusters. Samples from one scene share place, moment and neighbors, so treating them as
+    independent would make intervals too narrow. None with fewer than two clusters."""
+    values = np.asarray(values, dtype=np.float64)
+    _, cluster_index = np.unique(np.asarray(clusters), return_inverse=True)
+    num_clusters = int(cluster_index.max()) + 1 if len(values) else 0
+    if num_clusters < 2:
+        return None
+    sums = np.bincount(cluster_index, weights=values - values.mean())
+    variance = num_clusters / (num_clusters - 1) * (sums**2).sum() / len(values) ** 2
+    return float(Z_95 * np.sqrt(variance))
+
+
 def summarize(
-    per_sample: dict[str, np.ndarray], mask: np.ndarray, miss_threshold_m: float, num_modes: int
-) -> dict[str, float | int]:
+    per_sample: dict[str, np.ndarray],
+    mask: np.ndarray,
+    miss_threshold_m: float,
+    num_modes: int,
+    clusters: np.ndarray | None = None,
+) -> dict[str, float | int | None]:
+    """Means over the masked samples; with `clusters` (one scene id per sample), also 95%
+    confidence-interval half-widths as `<metric>_ci95`."""
     count = int(mask.sum())
     if count == 0:
         return {"count": 0}
-    summary: dict[str, float | int] = {
-        "count": count,
-        "ade": float(per_sample["ade"][mask].mean()),
-        "fde": float(per_sample["fde"][mask].mean()),
-    }
+    values = {"ade": per_sample["ade"][mask], "fde": per_sample["fde"][mask]}
     if num_modes > 1:
-        summary["min_ade"] = float(per_sample["min_ade"][mask].mean())
-        summary["min_fde"] = float(per_sample["min_fde"][mask].mean())
-    summary["miss_rate"] = float(misses(per_sample["min_fde"][mask], miss_threshold_m).mean())
+        values["min_ade"] = per_sample["min_ade"][mask]
+        values["min_fde"] = per_sample["min_fde"][mask]
+    values["miss_rate"] = misses(per_sample["min_fde"][mask], miss_threshold_m).astype(float)
+    summary: dict[str, float | int | None] = {"count": count}
+    for name, v in values.items():
+        summary[name] = float(v.mean())
+        if clusters is not None:
+            summary[f"{name}_ci95"] = clustered_ci95(v, np.asarray(clusters)[mask])
     return summary
 
 
@@ -54,12 +77,13 @@ def breakdown(
     class_names: Sequence[str],
     eval_cfg: EvaluationConfig,
     num_modes: int,
+    clusters: np.ndarray | None = None,
 ) -> dict:
     """Overall, per-class and per-class x speed-bucket summaries, each with its sample count."""
     moving = np.asarray(current_speeds) >= eval_cfg.stationary_speed_threshold_mps
 
-    def summary(mask: np.ndarray) -> dict[str, float | int]:
-        return summarize(per_sample, mask, eval_cfg.miss_threshold_m, num_modes)
+    def summary(mask: np.ndarray) -> dict[str, float | int | None]:
+        return summarize(per_sample, mask, eval_cfg.miss_threshold_m, num_modes, clusters)
 
     result: dict = {
         "overall": summary(np.ones(len(moving), dtype=bool)),

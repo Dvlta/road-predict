@@ -104,3 +104,30 @@ def test_config_rejects_unknown_model(tmp_path, raw_data):
 def test_data_only_config_has_no_model():
     with pytest.raises(ConfigError, match="no `model` section"):
         load_config(DEV_CONFIG).require_model()
+
+
+def test_shard_ranges(raw_data):
+    raw_data["splits"]["train"]["shards"] = "0-3,7,10-11"
+    assert data_config_from_dict(raw_data).splits["train"].shards == (0, 1, 2, 3, 7, 10, 11)
+    for bad in ("5-3", "1-x", "1--2"):
+        raw_data["splits"]["train"]["shards"] = bad
+        with pytest.raises(ConfigError):
+            data_config_from_dict(raw_data)
+
+
+def test_dev_and_exp_tiers_share_content_settings():
+    """Different shards only: same fingerprint, so caches are shared and dev ⊂ exp."""
+    dev, exp = load_config(DEV_CONFIG), load_config(DEV_CONFIG.parent / "data_exp.yaml")
+    assert data_fingerprint(dev.data, PREPROCESS_VERSION) == data_fingerprint(
+        exp.data, PREPROCESS_VERSION
+    )
+    for split in ("train", "val", "test"):
+        assert set(dev.data.splits[split].shards) <= set(exp.data.splits[split].shards)
+
+
+def test_data_config_override_sets_tier():
+    model_config = DEV_CONFIG.parent / "baseline_cv.yaml"
+    assert load_config(model_config).tier == "data_dev"
+    exp = load_config(model_config, data_config=DEV_CONFIG.parent / "data_exp.yaml")
+    assert exp.tier == "data_exp" and len(exp.data.splits["test"].shards) == 30
+    assert exp.require_model().name == "constant_velocity"

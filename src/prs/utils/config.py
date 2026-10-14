@@ -5,6 +5,7 @@ Unknown keys, missing keys, wrong types and windows that do not fit the scene al
 
 from __future__ import annotations
 
+import dataclasses
 from collections.abc import Callable
 from dataclasses import dataclass, fields
 from pathlib import Path
@@ -171,6 +172,12 @@ class Config:
     seed: int = 42
     model: ModelConfig | None = None
     evaluation: EvaluationConfig | None = None
+    data_source: Path | None = None  # file the `data` section came from (names the data tier)
+
+    @property
+    def tier(self) -> str:
+        """Short name of the data tier, e.g. "data_dev", taken from the data config file."""
+        return self.data_source.stem if self.data_source is not None else "inline"
 
     def require_model(self) -> ModelConfig:
         if self.model is None:
@@ -183,20 +190,26 @@ class Config:
         return self.evaluation
 
 
-def load_config(path: str | Path) -> Config:
+def load_config(path: str | Path, data_config: str | Path | None = None) -> Config:
     """Load a config. `data_config: <file>` pulls the `data` section from another config,
-    resolved relative to this file, so a model config can switch data tiers in one line."""
+    resolved relative to this file, so a model config can switch data tiers in one line.
+    The `data_config` argument overrides that reference (e.g. `--data-config` on the CLI)."""
     path = Path(path)
     raw = _load_mapping(path)
-    if "data_config" in raw:
+    data_source = path
+    if "data_config" in raw or data_config is not None:
+        referenced_name = raw.pop("data_config", None)
         if "data" in raw:
             raise ConfigError(f"{path}: give either `data` or `data_config`, not both")
-        data_path = path.parent / _as_str(raw.pop("data_config"), "data_config")
-        referenced = _load_mapping(data_path)
+        if data_config is not None:
+            data_source = Path(data_config)
+        else:
+            data_source = path.parent / _as_str(referenced_name, "data_config")
+        referenced = _load_mapping(data_source)
         if "data" not in referenced:
-            raise ConfigError(f"{data_path}: no `data` section")
+            raise ConfigError(f"{data_source}: no `data` section")
         raw["data"] = referenced["data"]
-    return config_from_dict(raw)
+    return dataclasses.replace(config_from_dict(raw), data_source=data_source)
 
 
 def config_from_dict(raw: dict[str, Any]) -> Config:
@@ -344,6 +357,22 @@ def _as_splits(value: Any, name: str) -> dict[str, SplitSpec]:
         _check_keys(spec, {"source", "shards"}, required={"source", "shards"}, where=where)
         splits[split] = SplitSpec(
             source=_as_str(spec["source"], f"{where}.source"),
-            shards=_as_int_tuple(spec["shards"], f"{where}.shards"),
+            shards=_as_shards(spec["shards"], f"{where}.shards"),
         )
     return splits
+
+
+def _as_shards(value: Any, name: str) -> tuple[int, ...]:
+    """A list of shard indices, or a string of inclusive ranges such as "0-14,20"."""
+    if not isinstance(value, str):
+        return _as_int_tuple(value, name)
+    shards: list[int] = []
+    for part in value.split(","):
+        bounds = part.strip().split("-")
+        if len(bounds) not in (1, 2) or not all(b.strip().isdigit() for b in bounds):
+            raise ConfigError(f"{name}: cannot parse {part!r} in {value!r}")
+        first, last = int(bounds[0]), int(bounds[-1])
+        if last < first:
+            raise ConfigError(f"{name}: empty range {part!r}")
+        shards.extend(range(first, last + 1))
+    return tuple(shards)
