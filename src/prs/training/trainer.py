@@ -34,6 +34,10 @@ from prs.utils.seed import set_seed
 
 BEST_METRIC = "val_ade"  # lower is better
 STEP_LOG_EVERY = 50
+# Seconds a loader may wait for one batch from its workers. A worker that fails to deliver
+# (for example, out of file descriptors) would otherwise leave the run waiting forever; a
+# batch normally takes well under a second, even from a cold network volume.
+LOADER_TIMEOUT_S = 600
 
 
 class NonFiniteLossError(RuntimeError):
@@ -84,6 +88,7 @@ class Trainer:
             "collate_fn": collate_batch,
             "num_workers": workers,
             "persistent_workers": workers > 0,
+            "timeout": LOADER_TIMEOUT_S if workers > 0 else 0,  # allowed only with workers
         }
         self.train_loader = DataLoader(
             train_dataset,

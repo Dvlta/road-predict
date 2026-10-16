@@ -3,6 +3,8 @@
 import dataclasses
 import json
 import pickle
+import subprocess
+import sys
 
 import numpy as np
 import pytest
@@ -10,7 +12,14 @@ import torch
 from conftest import CYCLIST, PED
 
 from prs.data import PREPROCESS_VERSION
-from prs.data.cache import CACHE_FIELDS, CacheError, ShardCache, shard_cache_dir, write_shard_cache
+from prs.data.cache import (
+    CACHE_FIELDS,
+    OPEN_FILE_LIMIT,
+    CacheError,
+    ShardCache,
+    shard_cache_dir,
+    write_shard_cache,
+)
 from prs.data.dataset import CachedDataset, ShuffledMapDataset, collate_batch
 from prs.data.preprocess import build_sample
 from prs.data.splits import shard_paths
@@ -109,6 +118,30 @@ def test_dataset_pickles_without_array_data(cfg, samples):
     restored = pickle.loads(pickle.dumps(dataset))
     assert restored.shards[0]._arrays == {}
     np.testing.assert_array_equal(restored[0]["map_polylines"], dataset[0]["map_polylines"])
+
+
+def test_opening_a_split_raises_the_open_file_limit(cfg, samples, tmp_path):
+    """Every memory map holds an open file, and 1,024 (common on Linux) is fewer than the full
+    model maps on `exp`. Runs in a subprocess, which lowers its own limit first."""
+    for path in shard_paths(cfg, "val"):
+        _write(cfg, samples, path.name)
+    (tmp_path / "cfg.pkl").write_bytes(pickle.dumps(cfg))
+    code = (
+        "import pickle, resource, sys\n"
+        "from prs.data.dataset import CachedDataset\n"
+        "soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)\n"
+        "resource.setrlimit(resource.RLIMIT_NOFILE, (256, hard))\n"
+        "CachedDataset(pickle.loads(open(sys.argv[1], 'rb').read()), 'val')\n"
+        "print(resource.getrlimit(resource.RLIMIT_NOFILE)[0], hard)\n"
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code, str(tmp_path / "cfg.pkl")],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    soft, hard = map(int, result.stdout.split())
+    assert soft == min(OPEN_FILE_LIMIT, hard)
 
 
 def test_shuffled_map_dataset_swaps_only_the_map():

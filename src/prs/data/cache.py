@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import resource
 import shutil
 import time
 from collections.abc import Sequence
@@ -34,6 +35,7 @@ from prs.utils.config import DataConfig
 from prs.utils.fingerprint import data_fingerprint, fingerprint_payload
 
 CACHE_FIELDS = tuple(f.name for f in dataclasses.fields(ProcessedSample) if f.name != "meta")
+OPEN_FILE_LIMIT = 65_536  # all 19 fields of all 1,000 WOMD training shards, with room to spare
 
 
 class CacheError(RuntimeError):
@@ -141,8 +143,26 @@ class ShardCache:
 
 
 def open_split_caches(cfg: DataConfig, split: str) -> list[ShardCache]:
+    raise_open_file_limit()
     t0s = split_t0s(cfg, split)
     return [ShardCache(shard_cache_dir(cfg, p.name), cfg, t0s) for p in shard_paths(cfg, split)]
+
+
+def raise_open_file_limit(target: int = OPEN_FILE_LIMIT) -> None:
+    """Raise this process's soft limit on open files to `target`, or to the hard limit if that
+    is lower. DataLoader workers inherit it. Every memory-mapped array holds an open file, and
+    a loader process maps each field it reads in every shard of its split: 1,200 files for the
+    full interaction model on `exp` (12 fields, 100 shards), past the soft limit of 1,024
+    common on Linux. A worker at the limit stops delivering batches without raising, so the
+    run hangs."""
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    if hard != resource.RLIM_INFINITY:
+        target = min(target, hard)
+    if soft != resource.RLIM_INFINITY and soft < target:
+        try:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+        except (ValueError, OSError):
+            pass  # macOS may cap below the hard limit; the trainer's loader timeout still fires
 
 
 def _fraction(flags: list[bool]) -> float | None:

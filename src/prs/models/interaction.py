@@ -23,7 +23,9 @@ class InteractionForecaster(ForecastModel):
     """Agent tokens: the §17 trajectory encoder, shared by the target and every neighbor, plus
     summed tags (agent type, is-SDC, is-target, position at t0). Map tokens: the §18 polyline
     encoder plus the position of the chunk's centroid. A learned null token is prepended and
-    always valid. Pre-norm Transformer layers mix all tokens; the target token is decoded.
+    always valid. Pre-norm Transformer layers mix all tokens. The decoder reads the target's
+    trajectory encoding concatenated with its Transformer output (the §18 fusion): decoding the
+    Transformer output alone trained markedly worse than the plain LSTM on the same inputs.
 
     `use_map` and `use_neighbors` switch the two context token sets on or off, giving the four
     variants of the §19 ablation with one architecture. Masking: padded neighbor slots (no
@@ -94,7 +96,7 @@ class InteractionForecaster(ForecastModel):
         )
         self.norm = nn.LayerNorm(hidden_dim)  # pre-norm layers leave the output unnormalized
         self.decoder = nn.Sequential(
-            nn.Linear(hidden_dim, decoder_hidden_dim),
+            nn.Linear(2 * hidden_dim, decoder_hidden_dim),
             nn.ReLU(),
             nn.Linear(decoder_hidden_dim, future_steps * 2),
         )
@@ -130,10 +132,10 @@ class InteractionForecaster(ForecastModel):
         is_target = torch.zeros_like(types)
         is_target[:, 0] = 1
 
-        agents = self._encode_agents(histories, valid, agent_valid)
+        encoded = self._encode_agents(histories, valid, agent_valid)
         at_t0 = histories[:, :, -1, :2] * valid[:, :, -1, None].to(histories.dtype)
         agents = (
-            agents
+            encoded
             + self.type_embedding(types)
             + self.sdc_embedding(is_sdc.long())
             + self.target_embedding(is_target)
@@ -155,7 +157,7 @@ class InteractionForecaster(ForecastModel):
         x, mask = torch.cat(tokens, dim=1), torch.cat(token_valid, dim=1)
         for layer in self.layers:
             x = _zero_padded(layer(x, src_key_padding_mask=~mask), mask)
-        decoded = self.decoder(self.norm(x[:, TARGET_SLOT]))
+        decoded = self.decoder(torch.cat([encoded[:, 0], self.norm(x[:, TARGET_SLOT])], dim=-1))
         trajectories = decoded.view(-1, 1, self.future_steps, 2)
         return {
             "trajectories": trajectories,

@@ -1,6 +1,7 @@
 """Training loop, checkpoints and resume (design doc §14.3 checks 5 and 9, §25)."""
 
 import dataclasses
+import time
 
 import numpy as np
 import pytest
@@ -55,6 +56,14 @@ class LinearTracks(Dataset):
             "target_future_valid": np.ones(T, bool),
             "index": i,
         }
+
+
+class StalledTracks(LinearTracks):
+    """A loader worker that never delivers a batch, like one out of file descriptors."""
+
+    def __getitem__(self, i: int) -> dict:
+        time.sleep(3600)
+        return super().__getitem__(i)
 
 
 def _cfg(**training):
@@ -118,6 +127,13 @@ def test_worker_count_does_not_change_training(tmp_path):
         runs.append(trainer.model.state_dict())
     for name, value in runs[0].items():
         torch.testing.assert_close(runs[1][name], value, rtol=0, atol=0)
+
+
+def test_stalled_loader_worker_raises(tmp_path, monkeypatch):
+    monkeypatch.setattr("prs.training.trainer.LOADER_TIMEOUT_S", 2)
+    trainer = _trainer(_cfg(num_workers=1), tmp_path, StalledTracks(32))
+    with pytest.raises(RuntimeError, match="timed out"):
+        trainer.fit(1)
 
 
 def test_nonfinite_loss_aborts_and_dumps_batch(tmp_path):
