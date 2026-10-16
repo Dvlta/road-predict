@@ -9,18 +9,25 @@ import torch
 from conftest import REPO_ROOT
 
 from prs.data.map_types import NUM_MAP_TYPES, MapType
-from prs.data.types import F_AGENT
+from prs.data.types import F_AGENT, ObjectType
 from prs.models import build_model
 from prs.models.base import MODEL_INPUT_FIELDS, ForecastModel, model_inputs
 from prs.models.constant_velocity import ConstantVelocity
+from prs.models.interaction import InteractionForecaster
 from prs.models.lstm_forecaster import LSTMForecaster
 from prs.models.lstm_map_forecaster import LSTMMapForecaster
 from prs.utils.config import MODEL_NAMES, load_config
 
-ALL_MODELS = (ForecastModel, ConstantVelocity, LSTMForecaster, LSTMMapForecaster)
-MODEL_CONFIGS = ("baseline_cv.yaml", "lstm.yaml", "lstm_map.yaml")
-LEARNED_CONFIGS = ("lstm.yaml", "lstm_map.yaml")
-H, T, N, M, P = 21, 60, 4, 6, 20
+ALL_MODELS = (
+    ForecastModel, ConstantVelocity, LSTMForecaster, LSTMMapForecaster, InteractionForecaster
+)  # fmt: skip
+INTERACTION_CONFIGS = (
+    "interaction_history.yaml", "interaction_map.yaml", "interaction_neighbors.yaml",
+    "interaction.yaml",
+)  # fmt: skip
+LEARNED_CONFIGS = ("lstm.yaml", "lstm_map.yaml", *INTERACTION_CONFIGS)
+MODEL_CONFIGS = ("baseline_cv.yaml", *LEARNED_CONFIGS)
+H, T, N, M, P = 21, 60, 6, 6, 20
 
 
 def test_model_forward_signature_excludes_future():
@@ -51,16 +58,32 @@ def _model(config_name: str, seed: int = 0) -> ForecastModel:
     return build_model(cfg.require_model(), cfg.data).eval()
 
 
+def _agents(rng: np.random.Generator, shape: tuple[int, ...], valid: np.ndarray) -> np.ndarray:
+    """Agent states as the cache stores them: valid_flag set, padded frames all zero."""
+    states = rng.normal(size=(*shape, H, F_AGENT)).astype(np.float32)
+    states[..., 8] = valid
+    states[~valid] = 0.0
+    return states
+
+
 def _batch(batch_size: int = 5, seed: int = 0) -> dict[str, np.ndarray]:
-    """A full batch with gaps in the history (leading and internal) and future-only fields."""
+    """A full batch with gaps in the history (leading and internal), neighbor slots as the
+    cache fills them (the SDC first, mixed types, trailing padded slots), and future-only
+    fields."""
     rng = np.random.default_rng(seed)
     history_valid = np.ones((batch_size, H), bool)
     history_valid[0, :8] = False  # leading gap
     history_valid[1, 5:9] = False  # internal gap
     history_valid[2, :-1] = False  # only t0 observed
-    history = rng.normal(size=(batch_size, H, F_AGENT)).astype(np.float32)
-    history[..., 8] = history_valid
-    history[~history_valid] = 0.0
+    history = _agents(rng, (batch_size,), history_valid)
+    neighbor_valid = rng.random((batch_size, N, H)) > 0.3
+    neighbor_valid[..., -1] = True  # selected neighbors are valid at t0 (design doc §8)
+    neighbor_valid[:, -2:] = False  # two padded slots per sample
+    neighbor_types = rng.integers(ObjectType.VEHICLE, len(ObjectType), size=(batch_size, N))
+    neighbor_types[:, 0] = ObjectType.VEHICLE
+    neighbor_types[:, -2:] = ObjectType.UNSET
+    neighbor_is_sdc = np.zeros((batch_size, N), bool)
+    neighbor_is_sdc[:, 0] = True
     map_valid = rng.random((batch_size, M, P)) > 0.3
     map_valid[:, -2:] = False  # two padded chunks per sample
     map_types = rng.integers(1, NUM_MAP_TYPES, size=(batch_size, M))
@@ -69,10 +92,10 @@ def _batch(batch_size: int = 5, seed: int = 0) -> dict[str, np.ndarray]:
         "target_history": history,
         "target_history_valid": history_valid,
         "target_type": np.full(batch_size, 2),
-        "neighbors": rng.normal(size=(batch_size, N, H, F_AGENT)).astype(np.float32),
-        "neighbor_valid": rng.random((batch_size, N, H)) > 0.3,
-        "neighbor_types": np.ones((batch_size, N), np.int64),
-        "neighbor_is_sdc": np.zeros((batch_size, N), bool),
+        "neighbors": _agents(rng, (batch_size, N), neighbor_valid),
+        "neighbor_valid": neighbor_valid,
+        "neighbor_types": neighbor_types,
+        "neighbor_is_sdc": neighbor_is_sdc,
         "map_polylines": rng.normal(size=(batch_size, M, P, 4)).astype(np.float32),
         "map_valid": map_valid,
         "map_types": map_types,
@@ -130,6 +153,9 @@ def test_padding_invariance(config_name):
         noisy[field][padded] = rng.normal(scale=50.0, size=noisy[field][padded].shape)
     padded_chunks = ~batch["map_valid"].any(axis=-1)
     noisy["map_types"][padded_chunks] = rng.integers(0, NUM_MAP_TYPES, size=padded_chunks.sum())
+    padded_slots = ~batch["neighbor_valid"].any(axis=-1)
+    noisy["neighbor_types"][padded_slots] = rng.integers(0, len(ObjectType), padded_slots.sum())
+    noisy["neighbor_is_sdc"][padded_slots] = True
     np.testing.assert_array_equal(_predict(model, batch), _predict(model, noisy))
 
 
@@ -144,20 +170,70 @@ def test_map_reaches_exactly_the_map_models(config_name):
     assert changed == ("map_polylines" in model.input_fields)
 
 
+@pytest.mark.parametrize("config_name", MODEL_CONFIGS)
+def test_neighbors_reach_exactly_the_neighbor_models(config_name):
+    """As above for neighbors: moving the valid neighbor states changes the output iff the
+    model declares neighbor inputs."""
+    model, batch = _model(config_name), _batch()
+    neighbors = batch["neighbors"].copy()
+    neighbors[..., :2][batch["neighbor_valid"]] += 3.0
+    moved = {**batch, "neighbors": neighbors}
+    changed = not np.array_equal(_predict(model, batch), _predict(model, moved))
+    assert changed == ("neighbors" in model.input_fields)
+
+
 @pytest.mark.parametrize("config_name", LEARNED_CONFIGS)
-def test_zero_map_chunks_give_finite_outputs_and_gradients(config_name):
-    """Check 10 (map part): a sample with no valid map chunk still gets finite outputs and
-    gradients, and its padded map content is ignored."""
+def test_zero_neighbors_zero_map_finite(config_name):
+    """Check 10: samples with no neighbor and no valid map chunk still get finite outputs and
+    gradients, and their padded neighbor and map content is ignored."""
     model, batch = _model(config_name).train(), _batch()
     empty = {**batch, "map_valid": np.zeros_like(batch["map_valid"]),
-             "map_types": np.zeros_like(batch["map_types"])}  # fmt: skip
+             "map_types": np.zeros_like(batch["map_types"]),
+             "neighbors": np.zeros_like(batch["neighbors"]),
+             "neighbor_valid": np.zeros_like(batch["neighbor_valid"]),
+             "neighbor_types": np.zeros_like(batch["neighbor_types"]),
+             "neighbor_is_sdc": np.zeros_like(batch["neighbor_is_sdc"])}  # fmt: skip
     output = model(**model_inputs(empty))["trajectories"]
     output.square().mean().backward()
     assert torch.isfinite(output).all()
     assert all(torch.isfinite(p.grad).all() for p in model.parameters() if p.grad is not None)
     model.eval()
-    other = {**empty, "map_polylines": batch["map_polylines"] * 7.0 + 1.0}
+    other = {**empty, "map_polylines": batch["map_polylines"] * 7.0 + 1.0,
+             "neighbors": batch["neighbors"] * 7.0 + 1.0}  # fmt: skip
     np.testing.assert_array_equal(_predict(model, empty), _predict(model, other))
+
+
+@pytest.mark.parametrize("config_name", MODEL_CONFIGS)
+def test_extra_padded_slots_change_nothing(config_name):
+    """More padding (larger N and M, the new slots empty) leaves outputs unchanged. Padded
+    tokens are zeroed, so the padding test alone cannot tell whether they are also excluded
+    from attention; this one can, since extra attended keys would shift every softmax."""
+    model, batch = _model(config_name), _batch()
+    wider = dict(batch)
+    for fields, extra in (
+        (("neighbors", "neighbor_valid", "neighbor_types", "neighbor_is_sdc"), 3),
+        (("map_polylines", "map_valid", "map_types"), 5),
+    ):
+        for field in fields:
+            value = batch[field]
+            empty = np.zeros((len(value), extra, *value.shape[2:]), value.dtype)
+            wider[field] = np.concatenate([value, empty], axis=1)
+    np.testing.assert_allclose(_predict(model, wider), _predict(model, batch), atol=1e-5)
+
+
+@pytest.mark.parametrize("config_name", INTERACTION_CONFIGS)
+def test_neighbor_and_map_slot_order_does_not_matter(config_name):
+    """Tokens carry no slot position: the SDC is known by its flag, not by being slot 0, and
+    reordering neighbors or map chunks only changes floating-point summation order."""
+    model, batch = _model(config_name), _batch()
+    rng = np.random.default_rng(2)
+    neighbor_order, chunk_order = rng.permutation(N), rng.permutation(M)
+    shuffled = dict(batch)
+    for field in ("neighbors", "neighbor_valid", "neighbor_types", "neighbor_is_sdc"):
+        shuffled[field] = batch[field][:, neighbor_order]
+    for field in ("map_polylines", "map_valid", "map_types"):
+        shuffled[field] = batch[field][:, chunk_order]
+    np.testing.assert_allclose(_predict(model, shuffled), _predict(model, batch), atol=1e-5)
 
 
 @pytest.mark.skipif(not torch.backends.mps.is_available(), reason="MPS not available")

@@ -2,14 +2,16 @@
 
     uv run python scripts/train.py --config configs/lstm.yaml
     uv run python scripts/train.py --config configs/lstm.yaml --data-config configs/data_exp.yaml
-    uv run python scripts/train.py --resume outputs/runs/<name> [--epochs 40]
+    uv run python scripts/train.py --resume outputs/runs/<name> [--epochs 40] [--num-workers 2]
 
     # Overfit check (§14.3 check 5): train and validate on the first 100 training samples
     uv run python scripts/train.py --config configs/lstm.yaml --subset 100 --epochs 300
 
 Writes outputs/runs/<name>/ (config.yaml, metrics.json, train.log, tensorboard/, best.pt,
 last.pt). Resuming reads the run's own config.yaml, so it continues the identical setup;
---epochs may raise the epoch count. View curves with `uv run tensorboard --logdir outputs/runs`.
+--epochs may raise the epoch count. --num-workers sets the loader processes (e.g. 2 on Colab's two
+cores) without changing results, so it may differ on resume too. View curves with
+`uv run tensorboard --logdir outputs/runs`.
 """
 
 from __future__ import annotations
@@ -47,6 +49,11 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/runs"))
     parser.add_argument("--manifest-dir", type=Path, default=Path("outputs/manifests"))
     parser.add_argument("--epochs", type=int, help="override training.epochs")
+    parser.add_argument(
+        "--num-workers",
+        type=int,
+        help="override training.num_workers (loader processes; results do not depend on it)",
+    )
     parser.add_argument("--device", choices=DEVICES, help="override the config's device")
     parser.add_argument(
         "--subset", type=int, help="overfit check: train and validate on the first N samples"
@@ -55,7 +62,9 @@ def main() -> None:
 
     if args.resume is not None:
         if args.data_config or args.name or args.subset or args.device:
-            parser.error("--resume reuses the run's settings; only --epochs may change")
+            parser.error(
+                "--resume reuses the run's settings; only --epochs and --num-workers may change"
+            )
         run_dir = args.resume
         check_run_dir(run_dir, resume=True)
         cfg = config_from_dict(yaml.safe_load((run_dir / "config.yaml").read_text()))
@@ -76,9 +85,11 @@ def main() -> None:
             "subset": args.subset,
             "created": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-    if args.epochs is not None:
+    overrides = {"epochs": args.epochs, "num_workers": args.num_workers}
+    overrides = {key: value for key, value in overrides.items() if value is not None}
+    if overrides:
         cfg = dataclasses.replace(
-            cfg, training=dataclasses.replace(cfg.require_training(), epochs=args.epochs)
+            cfg, training=dataclasses.replace(cfg.require_training(), **overrides)
         )
     training = cfg.require_training()
     tier = run_info["tier"]  # a resumed config is inline, so the tier comes from the run record

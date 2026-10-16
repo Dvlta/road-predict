@@ -19,7 +19,7 @@ from prs.data.collate import collate_samples
 from prs.data.preprocess import find_sample, pick_examples
 from prs.data.types import ObjectType
 from prs.metrics.breakdowns import per_sample_metrics
-from prs.models import build_model, is_learned
+from prs.models import build_model, is_learned, model_label
 from prs.models.base import model_inputs
 from prs.training.checkpoint import load_checkpoint, restore_model
 from prs.utils.config import SPLIT_NAMES, config_to_dict, load_config
@@ -75,7 +75,7 @@ def main() -> None:
             out,
             predictions=trajectories[0],
             probabilities=torch.softmax(output["logits"], dim=-1).numpy()[0],
-            subtitle=f"{model_cfg.name} · ADE {ade:.2f} m · FDE {fde:.2f} m",
+            subtitle=f"{model_label(model_cfg)} · ADE {ade:.2f} m · FDE {fde:.2f} m",
         )
         print(
             f"{ObjectType(meta.target_type).name.lower():<10} scenario {meta.scenario_id} "

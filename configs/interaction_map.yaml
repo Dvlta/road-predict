@@ -1,0 +1,31 @@
+# Interaction model (design doc §19) with the map but no neighbors: one of the four ablation
+# variants, which differ only in use_map / use_neighbors.
+seed: 42
+device: auto  # auto | cuda | mps | cpu
+data_config: data_dev.yaml
+
+model:
+  name: interaction
+  use_map: true
+  use_neighbors: false
+  hidden_dim: 256
+  num_layers: 2  # LSTM layers of the shared trajectory encoder
+  dropout: 0.1  # LSTM and Transformer layers
+  decoder_hidden_dim: 512
+  map_point_dim: 128  # point MLP 4 -> 64 -> 128, then masked max pool and 128 -> hidden_dim
+  transformer_layers: 3
+  transformer_heads: 8
+  transformer_ff_dim: 1024
+
+training:
+  batch_size: 64
+  epochs: 30
+  learning_rate: 0.0003
+  weight_decay: 0.0001
+  gradient_clip_norm: 5.0
+  smooth_l1_beta: 1.0  # metres; quadratic below, linear above
+  num_workers: 4
+
+evaluation:
+  miss_threshold_m: 2.0
+  stationary_speed_threshold_mps: 0.5

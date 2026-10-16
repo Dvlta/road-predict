@@ -181,6 +181,52 @@ def test_lstm_map_config_checks_map_settings(tmp_path, raw_data):
         load_config(path)
 
 
+def test_interaction_configs_differ_only_in_their_switches():
+    stems = ("interaction", "interaction_map", "interaction_neighbors", "interaction_history")
+    configs = {stem: load_config(DEV_CONFIG.parent / f"{stem}.yaml") for stem in stems}
+    switches = {stem: (c.require_model().use_map, c.require_model().use_neighbors)
+                for stem, c in configs.items()}  # fmt: skip
+    assert switches == {"interaction": (True, True), "interaction_map": (True, False),
+                        "interaction_neighbors": (False, True),
+                        "interaction_history": (False, False)}  # fmt: skip
+    rest = []
+    for cfg in configs.values():
+        plain = config_to_dict(cfg)
+        for key in ("use_map", "use_neighbors", "map_point_dim"):
+            plain["model"].pop(key, None)
+        rest.append(plain)
+    assert all(plain == rest[0] for plain in rest)
+
+
+def test_interaction_config_checks_its_settings(tmp_path, raw_data):
+    path = tmp_path / "model.yaml"
+    section = {"name": "interaction", "use_map": True, "use_neighbors": True, "hidden_dim": 256,
+               "num_layers": 2, "dropout": 0.1, "decoder_hidden_dim": 512, "map_point_dim": 128,
+               "transformer_layers": 3, "transformer_heads": 8,
+               "transformer_ff_dim": 1024}  # fmt: skip
+    path.write_text(yaml.safe_dump({"data": raw_data, "model": section}))
+    load_config(path)
+    no_map = {**section, "use_map": False}
+    path.write_text(yaml.safe_dump({"data": raw_data, "model": no_map}))
+    with pytest.raises(ConfigError, match="model.map_point_dim is not used"):
+        load_config(path)
+    del no_map["map_point_dim"]
+    path.write_text(yaml.safe_dump({"data": raw_data, "model": no_map}))
+    load_config(path)
+    del section["map_point_dim"]
+    path.write_text(yaml.safe_dump({"data": raw_data, "model": section}))
+    with pytest.raises(ConfigError, match="model.map_point_dim is required"):
+        load_config(path)
+    for bad, message in (
+        ({"transformer_heads": 6}, "divisible by model.transformer_heads"),
+        ({"use_map": "yes"}, "expected true/false"),
+        ({"transformer_layers": 0}, "transformer_layers must be positive"),
+    ):
+        path.write_text(yaml.safe_dump({"data": raw_data, "model": {**no_map, **bad}}))
+        with pytest.raises(ConfigError, match=message):
+            load_config(path)
+
+
 def test_config_rejects_unknown_device(tmp_path, raw_data):
     path = tmp_path / "device.yaml"
     path.write_text(yaml.safe_dump({"data": raw_data, "device": "tpu"}))

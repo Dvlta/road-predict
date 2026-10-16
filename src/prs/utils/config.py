@@ -17,14 +17,20 @@ from prs.data.types import OBJECT_TYPE_BY_NAME
 
 FRAME_HEADING_SOURCES = ("box", "velocity", "auto")
 MAP_DTYPES = ("float32", "float16")
-MODEL_NAMES = ("constant_velocity", "lstm", "lstm_map")
+MODEL_NAMES = ("constant_velocity", "lstm", "lstm_map", "interaction")
 # Hyperparameters each model requires in its `model` section; every other one must be absent.
+# The interaction model also requires map_point_dim when use_map is true (ModelConfig.required).
 MODEL_PARAMS: dict[str, tuple[str, ...]] = {
     "constant_velocity": (),
     "lstm": ("hidden_dim", "num_layers", "dropout", "decoder_hidden_dim"),
     "lstm_map": (
         "hidden_dim", "num_layers", "dropout", "decoder_hidden_dim",
         "map_point_dim", "map_attention_heads",
+    ),
+    "interaction": (
+        "hidden_dim", "num_layers", "dropout", "decoder_hidden_dim",
+        "use_map", "use_neighbors", "transformer_layers", "transformer_heads",
+        "transformer_ff_dim",
     ),
 }  # fmt: skip
 DEVICES = ("auto", "cuda", "mps", "cpu")
@@ -164,10 +170,22 @@ class ModelConfig:
     decoder_hidden_dim: int | None = None
     map_point_dim: int | None = None  # point-MLP width: 4 -> map_point_dim / 2 -> map_point_dim
     map_attention_heads: int | None = None
+    use_map: bool | None = None  # interaction model: map chunks as tokens
+    use_neighbors: bool | None = None  # interaction model: neighbor agents as tokens
+    transformer_layers: int | None = None
+    transformer_heads: int | None = None
+    transformer_ff_dim: int | None = None
+
+    @property
+    def required(self) -> tuple[str, ...]:
+        """The hyperparameters this model's section must give (all others must be absent)."""
+        if self.name == "interaction" and self.use_map:
+            return (*MODEL_PARAMS[self.name], "map_point_dim")
+        return MODEL_PARAMS[self.name]
 
     def __post_init__(self) -> None:
         _require(self.name in MODEL_NAMES, f"model.name must be one of {MODEL_NAMES}")
-        required = MODEL_PARAMS[self.name]
+        required = self.required
         for f in fields(self)[1:]:
             given = getattr(self, f.name) is not None
             _require(
@@ -177,7 +195,8 @@ class ModelConfig:
                 + f" by model {self.name!r}",
             )
         for name in (
-            "hidden_dim", "num_layers", "decoder_hidden_dim", "map_point_dim", "map_attention_heads"
+            "hidden_dim", "num_layers", "decoder_hidden_dim", "map_point_dim",
+            "map_attention_heads", "transformer_layers", "transformer_heads", "transformer_ff_dim",
         ):  # fmt: skip
             value = getattr(self, name)
             _require(value is None or value > 0, f"model.{name} must be positive")
@@ -191,6 +210,10 @@ class ModelConfig:
         _require(
             self.map_attention_heads is None or self.hidden_dim % self.map_attention_heads == 0,
             "model.hidden_dim must be divisible by model.map_attention_heads",
+        )
+        _require(
+            self.transformer_heads is None or self.hidden_dim % self.transformer_heads == 0,
+            "model.hidden_dim must be divisible by model.transformer_heads",
         )
 
 
@@ -353,6 +376,11 @@ def _model_section(raw: dict[str, Any]) -> ModelConfig | None:
         "decoder_hidden_dim": _as_int,
         "map_point_dim": _as_int,
         "map_attention_heads": _as_int,
+        "use_map": _as_bool,
+        "use_neighbors": _as_bool,
+        "transformer_layers": _as_int,
+        "transformer_heads": _as_int,
+        "transformer_ff_dim": _as_int,
     }
     _check_keys(section, set(converters), required={"name"}, where="model")
     return ModelConfig(**{key: converters[key](v, f"model.{key}") for key, v in section.items()})

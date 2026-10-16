@@ -32,7 +32,7 @@ from prs.data.splits import shard_paths
 from prs.metrics.breakdowns import breakdown, per_sample_metrics
 from prs.metrics.manifest import sample_key, save_manifest
 from prs.metrics.tables import breakdown_table
-from prs.models import build_model, is_learned
+from prs.models import build_model, is_learned, model_label
 from prs.training.checkpoint import load_checkpoint, restore_model
 from prs.training.device import select_device
 from prs.training.inference import predict
@@ -124,7 +124,7 @@ def main() -> None:
     per_sample_path = out.with_name(f"{stem}.per_sample.npz")
     shuffled = args.shuffle_map is not None
     report = {
-        "model": model_cfg.name + (" (shuffled map)" if shuffled else ""),
+        "model": model_label(model_cfg) + (" (shuffled map)" if shuffled else ""),
         "map_shuffle_seed": args.shuffle_map,
         "model_info": {
             "uses_map": "map_polylines" in model.input_fields,

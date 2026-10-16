@@ -86,8 +86,11 @@ def test_training_loss_decreases(tmp_path):
     assert (tmp_path / "best.pt").exists() and (tmp_path / "metrics.json").exists()
 
 
-def test_resume_matches_uninterrupted_run(tmp_path):
-    cfg, data = _cfg(), LinearTracks(96)
+@pytest.mark.parametrize("workers", [0, 2])
+def test_resume_matches_uninterrupted_run(tmp_path, workers):
+    """With loader workers too: a resumed loader starts fresh, while an uninterrupted run
+    reuses its persistent workers, and the shuffle order must not depend on that."""
+    cfg, data = _cfg(num_workers=workers), LinearTracks(96)
     straight = _trainer(cfg, tmp_path / "straight", data)
     straight.fit(2)
 
@@ -104,6 +107,17 @@ def test_resume_matches_uninterrupted_run(tmp_path):
         {**r, "train_seconds": s["train_seconds"], "train_samples_per_s": s["train_samples_per_s"]}
         for r, s in zip(straight.history, second.history, strict=True)
     ]
+
+
+def test_worker_count_does_not_change_training(tmp_path):
+    """So `train.py --num-workers` may differ between machines, even when resuming a run."""
+    data, runs = LinearTracks(96), []
+    for workers in (0, 2):
+        trainer = _trainer(_cfg(num_workers=workers), tmp_path / str(workers), data)
+        trainer.fit(2)
+        runs.append(trainer.model.state_dict())
+    for name, value in runs[0].items():
+        torch.testing.assert_close(runs[1][name], value, rtol=0, atol=0)
 
 
 def test_nonfinite_loss_aborts_and_dumps_batch(tmp_path):

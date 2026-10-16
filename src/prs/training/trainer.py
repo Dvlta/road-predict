@@ -18,7 +18,7 @@ from typing import Any
 import numpy as np
 import torch
 from torch import Tensor
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, RandomSampler
 from tqdm import tqdm
 
 from prs.data.dataset import collate_batch
@@ -73,6 +73,10 @@ class Trainer:
             lr=self.training.learning_rate,
             weight_decay=self.training.weight_decay,
         )
+        # The shuffle order comes only from this generator, reseeded every epoch. Each loader
+        # also gets a private generator for its own draws (worker seeds, made whenever it starts
+        # its workers), so neither the order nor the global RNG (dropout) depends on whether a
+        # loader is fresh (a resumed run) or reuses persistent workers, or on the worker count.
         self.generator = torch.Generator()
         workers = self.training.num_workers
         loader_args = {
@@ -82,9 +86,14 @@ class Trainer:
             "persistent_workers": workers > 0,
         }
         self.train_loader = DataLoader(
-            train_dataset, shuffle=True, generator=self.generator, **loader_args
+            train_dataset,
+            sampler=RandomSampler(train_dataset, generator=self.generator),
+            generator=torch.Generator(),
+            **loader_args,
         )
-        self.val_loader = DataLoader(val_dataset, shuffle=False, **loader_args)
+        self.val_loader = DataLoader(
+            val_dataset, shuffle=False, generator=torch.Generator(), **loader_args
+        )
         self.epoch = 0  # completed epochs
         self.history: list[dict[str, Any]] = []
         self.best: dict[str, Any] | None = None
