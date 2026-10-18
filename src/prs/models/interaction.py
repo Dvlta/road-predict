@@ -28,13 +28,14 @@ class InteractionForecaster(ForecastModel):
     Transformer output alone trained markedly worse than the plain LSTM on the same inputs.
 
     `use_map` and `use_neighbors` switch the two context token sets on or off, giving the four
-    variants of the §19 ablation with one architecture. Masking: padded neighbor slots (no
-    valid frame) never reach the encoder, padded tokens are zeroed before the first layer and
-    after every layer, and they are excluded as attention keys, so padded values cannot change
-    the output (design doc §14.2).
-    """
+    variants of the §19 ablation with one architecture. With `num_modes` K > 1 (the §20
+    multimodal model) the decoder predicts K futures and a mode head scores them; with K = 1
+    the parameters are exactly the deterministic model's, and the logits are zeros.
 
-    num_modes = 1
+    Masking: padded neighbor slots (no valid frame) never reach the encoder, padded tokens are
+    zeroed before the first layer and after every layer, and they are excluded as attention
+    keys, so padded values cannot change the output (design doc §14.2).
+    """
 
     def __init__(
         self,
@@ -53,10 +54,12 @@ class InteractionForecaster(ForecastModel):
         transformer_heads: int,
         transformer_ff_dim: int,
         map_point_dim: int | None = None,
+        num_modes: int = 1,
     ) -> None:
         super().__init__()
         if use_map and map_point_dim is None:
             raise ValueError("use_map needs map_point_dim")
+        self.num_modes = num_modes
         self.future_steps = future_steps
         self.use_map, self.use_neighbors = use_map, use_neighbors
         self.input_fields = (
@@ -98,7 +101,14 @@ class InteractionForecaster(ForecastModel):
         self.decoder = nn.Sequential(
             nn.Linear(2 * hidden_dim, decoder_hidden_dim),
             nn.ReLU(),
-            nn.Linear(decoder_hidden_dim, future_steps * 2),
+            nn.Linear(decoder_hidden_dim, num_modes * future_steps * 2),
+        )
+        self.mode_head = (
+            nn.Sequential(
+                nn.Linear(2 * hidden_dim, hidden_dim), nn.ReLU(), nn.Linear(hidden_dim, num_modes)
+            )
+            if num_modes > 1
+            else None
         )
 
     def forward(
@@ -157,12 +167,13 @@ class InteractionForecaster(ForecastModel):
         x, mask = torch.cat(tokens, dim=1), torch.cat(token_valid, dim=1)
         for layer in self.layers:
             x = _zero_padded(layer(x, src_key_padding_mask=~mask), mask)
-        decoded = self.decoder(torch.cat([encoded[:, 0], self.norm(x[:, TARGET_SLOT])], dim=-1))
-        trajectories = decoded.view(-1, 1, self.future_steps, 2)
-        return {
-            "trajectories": trajectories,
-            "logits": torch.zeros(len(trajectories), 1, device=trajectories.device),
-        }
+        features = torch.cat([encoded[:, 0], self.norm(x[:, TARGET_SLOT])], dim=-1)
+        trajectories = self.decoder(features).view(batch, self.num_modes, self.future_steps, 2)
+        if self.mode_head is None:
+            logits = torch.zeros(batch, 1, device=trajectories.device)
+        else:
+            logits = self.mode_head(features)
+        return {"trajectories": trajectories, "logits": logits}
 
     def _encode_agents(self, histories: Tensor, valid: Tensor, agent_valid: Tensor) -> Tensor:
         """Run the trajectory encoder on the real agents only ([B, A, H, F] -> [B, A, D]);

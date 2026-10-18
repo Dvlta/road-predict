@@ -9,6 +9,7 @@ from conftest import DEV_CONFIG
 
 from prs.data import PREPROCESS_VERSION
 from prs.utils.config import (
+    MULTIMODAL_TRAINING_PARAMS,
     ConfigError,
     config_from_dict,
     config_to_dict,
@@ -225,6 +226,50 @@ def test_interaction_config_checks_its_settings(tmp_path, raw_data):
         path.write_text(yaml.safe_dump({"data": raw_data, "model": {**no_map, **bad}}))
         with pytest.raises(ConfigError, match=message):
             load_config(path)
+
+
+def test_multimodal_config_is_the_full_interaction_config_with_modes():
+    interaction = config_to_dict(load_config(DEV_CONFIG.parent / "interaction.yaml"))
+    multimodal = config_to_dict(load_config(DEV_CONFIG.parent / "multimodal.yaml"))
+    assert multimodal["model"].pop("name") == "multimodal" and interaction["model"].pop("name")
+    assert multimodal["model"].pop("num_modes") == 6
+    assert multimodal["training"].pop("epochs") == 50 and interaction["training"].pop("epochs")
+    for key in MULTIMODAL_TRAINING_PARAMS:
+        multimodal["training"].pop(key)
+    assert multimodal == interaction
+
+
+def test_multimodal_settings_are_checked(tmp_path, raw_data):
+    path = tmp_path / "model.yaml"
+    model = {"name": "multimodal", "use_map": False, "use_neighbors": True, "hidden_dim": 256,
+             "num_layers": 2, "dropout": 0.1, "decoder_hidden_dim": 512, "transformer_layers": 3,
+             "transformer_heads": 8, "transformer_ff_dim": 1024, "num_modes": 6}  # fmt: skip
+    training = {"batch_size": 64, "epochs": 30, "learning_rate": 3e-4, "weight_decay": 1e-4,
+                "gradient_clip_norm": 5.0, "smooth_l1_beta": 1.0, "num_workers": 4,
+                "lambda_cls": 1.0, "wta_selection": "ade", "collapse_min_win_rate": 0.02,
+                "collapse_check_after_epochs": 3}  # fmt: skip
+    deterministic = {k: v for k, v in training.items() if k not in MULTIMODAL_TRAINING_PARAMS}
+    interaction = {k: v for k, v in model.items() if k != "num_modes"} | {"name": "interaction"}
+
+    def load(model_section, training_section):
+        sections = {"data": raw_data, "model": model_section, "training": training_section}
+        path.write_text(yaml.safe_dump(sections))
+        return load_config(path)
+
+    assert load(model, training).require_training().wta_selection == "ade"
+    assert load(interaction, deterministic).require_training().lambda_cls is None
+    for model_section, training_section, message in (
+        (model, deterministic, "training.lambda_cls is required by model 'multimodal'"),
+        (interaction, training, "training.lambda_cls is not used by model 'interaction'"),
+        ({**interaction, "num_modes": 6}, deterministic, "model.num_modes is not used"),
+        ({**model, "num_modes": 1}, training, "num_modes must be at least 2"),
+        (model, {**training, "wta_selection": "mse"}, "wta_selection must be one of"),
+        (model, {**training, "collapse_min_win_rate": 1.0}, r"must be in \[0, 1\)"),
+        (model, {**training, "collapse_check_after_epochs": 0}, "must be positive"),
+        (model, {**training, "lambda_cls": -1.0}, "lambda_cls must be >= 0"),
+    ):
+        with pytest.raises(ConfigError, match=message):
+            load(model_section, training_section)
 
 
 def test_config_rejects_unknown_device(tmp_path, raw_data):

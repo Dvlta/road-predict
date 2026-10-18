@@ -21,9 +21,9 @@ from prs.utils.config import MODEL_NAMES, load_config
 ALL_MODELS = (
     ForecastModel, ConstantVelocity, LSTMForecaster, LSTMMapForecaster, InteractionForecaster
 )  # fmt: skip
-INTERACTION_CONFIGS = (
+INTERACTION_CONFIGS = (  # one architecture; the multimodal model adds K modes (§20)
     "interaction_history.yaml", "interaction_map.yaml", "interaction_neighbors.yaml",
-    "interaction.yaml",
+    "interaction.yaml", "multimodal.yaml",
 )  # fmt: skip
 LEARNED_CONFIGS = ("lstm.yaml", "lstm_map.yaml", *INTERACTION_CONFIGS)
 MODEL_CONFIGS = ("baseline_cv.yaml", *LEARNED_CONFIGS)
@@ -106,8 +106,10 @@ def _batch(batch_size: int = 5, seed: int = 0) -> dict[str, np.ndarray]:
 
 
 def _predict(model: ForecastModel, batch: dict, device: str = "cpu") -> np.ndarray:
+    """Trajectories and mode logits, flattened together, so every check covers both."""
     with torch.no_grad():
-        return model.to(device)(**model_inputs(batch, device))["trajectories"].cpu().numpy()
+        output = model.to(device)(**model_inputs(batch, device))
+    return np.concatenate([output[key].cpu().numpy().ravel() for key in ("trajectories", "logits")])
 
 
 def test_every_model_name_has_a_config_that_builds():
@@ -244,3 +246,17 @@ def test_cpu_mps_parity(config_name):
     cpu = _predict(_model(config_name), batch, "cpu")
     mps = _predict(_model(config_name), batch, "mps")
     np.testing.assert_allclose(mps, cpu, rtol=1e-4, atol=1e-4)
+
+
+def test_mode_head_only_with_several_modes():
+    """One mode keeps the deterministic model's parameters, so Stage 7 checkpoints still load;
+    K modes start apart and get distinct scores."""
+    deterministic, multimodal = _model("interaction.yaml"), _model("multimodal.yaml")
+    assert deterministic.num_modes == 1 and deterministic.mode_head is None
+    assert not any(key.startswith("mode_head") for key in deterministic.state_dict())
+    with torch.no_grad():
+        output = multimodal(**model_inputs(_batch()))
+    ends, logits = output["trajectories"][:, :, -1], output["logits"]
+    assert multimodal.num_modes == 6 and output["trajectories"].shape == (5, 6, T, 2)
+    assert (torch.cdist(ends, ends) + torch.eye(6) > 0).all()  # no two modes coincide
+    assert (logits.std(dim=1) > 0).all()

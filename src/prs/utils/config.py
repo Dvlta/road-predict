@@ -6,7 +6,7 @@ Unknown keys, missing keys, wrong types and windows that do not fit the scene al
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any
@@ -17,9 +17,10 @@ from prs.data.types import OBJECT_TYPE_BY_NAME
 
 FRAME_HEADING_SOURCES = ("box", "velocity", "auto")
 MAP_DTYPES = ("float32", "float16")
-MODEL_NAMES = ("constant_velocity", "lstm", "lstm_map", "interaction")
+MODEL_NAMES = ("constant_velocity", "lstm", "lstm_map", "interaction", "multimodal")
 # Hyperparameters each model requires in its `model` section; every other one must be absent.
-# The interaction model also requires map_point_dim when use_map is true (ModelConfig.required).
+# The interaction and multimodal models also require map_point_dim when use_map is true
+# (ModelConfig.required).
 MODEL_PARAMS: dict[str, tuple[str, ...]] = {
     "constant_velocity": (),
     "lstm": ("hidden_dim", "num_layers", "dropout", "decoder_hidden_dim"),
@@ -32,7 +33,18 @@ MODEL_PARAMS: dict[str, tuple[str, ...]] = {
         "use_map", "use_neighbors", "transformer_layers", "transformer_heads",
         "transformer_ff_dim",
     ),
+    "multimodal": (  # the interaction model with K predicted futures (design doc §20)
+        "hidden_dim", "num_layers", "dropout", "decoder_hidden_dim",
+        "use_map", "use_neighbors", "transformer_layers", "transformer_heads",
+        "transformer_ff_dim", "num_modes",
+    ),
 }  # fmt: skip
+# Training settings of the winner-takes-all loss (design doc §20): required by models with
+# num_modes, absent otherwise.
+MULTIMODAL_TRAINING_PARAMS = (
+    "lambda_cls", "wta_selection", "collapse_min_win_rate", "collapse_check_after_epochs"
+)  # fmt: skip
+WTA_SELECTIONS = ("ade", "fde")
 DEVICES = ("auto", "cuda", "mps", "cpu")
 SPLIT_NAMES = ("train", "val", "test")
 # Official source split each project split must come from (design doc §10.2).
@@ -175,11 +187,12 @@ class ModelConfig:
     transformer_layers: int | None = None
     transformer_heads: int | None = None
     transformer_ff_dim: int | None = None
+    num_modes: int | None = None  # multimodal model: predicted futures per target
 
     @property
     def required(self) -> tuple[str, ...]:
         """The hyperparameters this model's section must give (all others must be absent)."""
-        if self.name == "interaction" and self.use_map:
+        if self.name in ("interaction", "multimodal") and self.use_map:
             return (*MODEL_PARAMS[self.name], "map_point_dim")
         return MODEL_PARAMS[self.name]
 
@@ -215,6 +228,10 @@ class ModelConfig:
             self.transformer_heads is None or self.hidden_dim % self.transformer_heads == 0,
             "model.hidden_dim must be divisible by model.transformer_heads",
         )
+        _require(
+            self.num_modes is None or self.num_modes >= 2,
+            "model.num_modes must be at least 2 (one mode is the interaction model)",
+        )
 
 
 @dataclass(frozen=True)
@@ -226,6 +243,10 @@ class TrainingConfig:
     gradient_clip_norm: float
     smooth_l1_beta: float
     num_workers: int
+    lambda_cls: float | None = None  # weight of the mode-classification loss
+    wta_selection: str | None = None  # the winning mode has the lowest ADE or FDE
+    collapse_min_win_rate: float | None = None
+    collapse_check_after_epochs: int | None = None
 
     def __post_init__(self) -> None:
         for name in ("batch_size", "epochs", "learning_rate", "gradient_clip_norm"):
@@ -233,6 +254,21 @@ class TrainingConfig:
         _require(self.weight_decay >= 0, "training.weight_decay must be >= 0")
         _require(self.smooth_l1_beta > 0, "training.smooth_l1_beta must be positive")
         _require(self.num_workers >= 0, "training.num_workers must be >= 0")
+        _require(
+            self.lambda_cls is None or self.lambda_cls >= 0, "training.lambda_cls must be >= 0"
+        )
+        _require(
+            self.wta_selection is None or self.wta_selection in WTA_SELECTIONS,
+            f"training.wta_selection must be one of {WTA_SELECTIONS}",
+        )
+        _require(
+            self.collapse_min_win_rate is None or 0 <= self.collapse_min_win_rate < 1,
+            "training.collapse_min_win_rate must be in [0, 1)",
+        )
+        _require(
+            self.collapse_check_after_epochs is None or self.collapse_check_after_epochs > 0,
+            "training.collapse_check_after_epochs must be positive",
+        )
 
 
 @dataclass(frozen=True)
@@ -260,6 +296,16 @@ class Config:
 
     def __post_init__(self) -> None:
         _require(self.device in DEVICES, f"device must be one of {DEVICES}")
+        if self.model is not None and self.training is not None:
+            multimodal = self.model.num_modes is not None
+            for name in MULTIMODAL_TRAINING_PARAMS:
+                given = getattr(self.training, name) is not None
+                _require(
+                    given == multimodal,
+                    f"training.{name} is "
+                    + ("required" if not given else "not used")
+                    + f" by model {self.model.name!r}",
+                )
 
     @property
     def tier(self) -> str:
@@ -324,7 +370,12 @@ def config_from_dict(raw: dict[str, Any]) -> Config:
                 "gradient_clip_norm": _as_float,
                 "smooth_l1_beta": _as_float,
                 "num_workers": _as_int,
+                "lambda_cls": _as_float,
+                "wta_selection": _as_str,
+                "collapse_min_win_rate": _as_float,
+                "collapse_check_after_epochs": _as_int,
             },
+            optional=MULTIMODAL_TRAINING_PARAMS,
         ),
         evaluation=_section(
             raw,
@@ -381,6 +432,7 @@ def _model_section(raw: dict[str, Any]) -> ModelConfig | None:
         "transformer_layers": _as_int,
         "transformer_heads": _as_int,
         "transformer_ff_dim": _as_int,
+        "num_modes": _as_int,
     }
     _check_keys(section, set(converters), required={"name"}, where="model")
     return ModelConfig(**{key: converters[key](v, f"model.{key}") for key, v in section.items()})
@@ -394,18 +446,24 @@ def _load_mapping(path: Path) -> dict[str, Any]:
 
 
 def _section(
-    raw: dict[str, Any], name: str, cls: type, converters: dict[str, Callable[[Any, str], Any]]
+    raw: dict[str, Any],
+    name: str,
+    cls: type,
+    converters: dict[str, Callable[[Any, str], Any]],
+    optional: Sequence[str] = (),
 ) -> Any:
-    """Build an optional, fully specified config section."""
+    """Build an optional config section that gives every key except possibly the `optional`
+    ones (left None when absent)."""
     if name not in raw:
         return None
     section = raw[name]
     if not isinstance(section, dict):
         raise ConfigError(f"{name}: expected a mapping")
-    _check_keys(section, set(converters), required=set(converters), where=name)
+    _check_keys(section, set(converters), required=set(converters) - set(optional), where=name)
     return cls(
-        **{key: convert(section[key], f"{name}.{key}") for key, convert in converters.items()}
-    )
+        **{key: convert(section[key], f"{name}.{key}") for key, convert in converters.items()
+           if key in section}
+    )  # fmt: skip
 
 
 def data_config_from_dict(raw: dict[str, Any]) -> DataConfig:

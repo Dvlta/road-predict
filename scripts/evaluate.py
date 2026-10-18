@@ -31,6 +31,7 @@ from prs.data.dataset import LABEL_FIELDS, CachedDataset, ShuffledMapDataset, co
 from prs.data.splits import shard_paths
 from prs.metrics.breakdowns import breakdown, per_sample_metrics
 from prs.metrics.manifest import sample_key, save_manifest
+from prs.metrics.multimodal import mode_statistics, ranking, winners
 from prs.metrics.tables import breakdown_table
 from prs.models import build_model, is_learned, model_label
 from prs.training.checkpoint import load_checkpoint, restore_model
@@ -50,6 +51,20 @@ def print_report(report: dict) -> None:
         f"median {sanity['first_step_error_median_m']:.3f} m · "
         f"{manifest['num_samples']} samples, manifest {manifest['sha256']}"
     )
+    if "modes" in report:
+        modes = report["modes"]
+        wins = " ".join(f"{rate:.1%}" for rate in modes["win_rates"])
+        print(
+            f"modes: wins {wins} · endpoint spread {modes['endpoint_spread_m']:.2f} m · "
+            f"entropy {modes['entropy']:.2f} nats"
+        )
+        print(
+            f"ranking: top-1 picks the closest mode {modes['top1_accuracy']:.1%} of the time "
+            f"(stated confidence {modes['top1_confidence']:.1%}) · winner probability "
+            f"{modes['winner_probability']:.3f} · winner NLL {modes['winner_nll']:.3f} "
+            f"(uniform {modes['uniform_nll']:.3f}) · calibration error "
+            f"{modes['calibration_error']:.3f}"
+        )
 
 
 def main() -> None:
@@ -153,6 +168,18 @@ def main() -> None:
         "filter_counts": dataset.filter_counts(),
         "per_sample": str(per_sample_path),
     }
+    ranked = {}
+    if model.num_modes > 1:  # collapse monitors and ranking (design doc §20, §21)
+        selection = cfg.require_training().wta_selection
+        report["modes"] = mode_statistics(
+            results["trajectories"], results["logits"],
+            results["target_future"], results["target_future_valid"], selection, scenes,
+        )  # fmt: skip
+        won = winners(
+            results["trajectories"], results["target_future"], results["target_future_valid"],
+            selection,
+        )  # fmt: skip
+        ranked = ranking(results["logits"], won)
     out.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         per_sample_path,
@@ -161,6 +188,7 @@ def main() -> None:
         target_type=results["target_type"],
         current_speed_mps=speeds,
         **{name: per_sample[name] for name in ("ade", "fde", "min_ade", "min_fde")},
+        **{name: ranked[name] for name in ("top1_hit", "winner_nll") if name in ranked},
     )
     out.write_text(json.dumps(report, indent=2))
     print_report(report)

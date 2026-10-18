@@ -142,9 +142,14 @@ def main() -> None:
             f"{val_split} samples | git {provenance['git_commit']}"
         )
     best = trainer.fit(training.epochs)
+    best_of_k = (
+        f", minADE {best['val_min_ade']:.3f} m, minFDE {best['val_min_fde']:.3f} m"
+        if "val_min_ade" in best
+        else ""
+    )
     logger.info(
         f"done. best epoch {best['epoch']}: val ADE {best['val_ade']:.3f} m, "
-        f"FDE {best['val_fde']:.3f} m -> {run_dir / 'best.pt'}"
+        f"FDE {best['val_fde']:.3f} m{best_of_k} -> {run_dir / 'best.pt'}"
     )
     logger.close()
 

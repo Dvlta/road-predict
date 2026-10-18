@@ -78,6 +78,23 @@ def _cfg(**training):
     )
 
 
+def _multimodal_cfg(**training):
+    """A small history-only multimodal model with 3 modes."""
+    cfg = load_config(REPO_ROOT / "configs" / "multimodal.yaml")
+    small = dataclasses.replace(
+        cfg.require_model(), use_map=False, use_neighbors=False, map_point_dim=None,
+        hidden_dim=32, decoder_hidden_dim=64, transformer_layers=1, transformer_heads=4,
+        transformer_ff_dim=64, num_modes=3,
+    )  # fmt: skip
+    defaults = {"batch_size": 32, "epochs": 2, "num_workers": 0, "learning_rate": 1e-3}
+    return dataclasses.replace(
+        cfg,
+        model=small,
+        device="cpu",
+        training=dataclasses.replace(cfg.require_training(), **{**defaults, **training}),
+    )
+
+
 def _trainer(cfg, run_dir, train, val=None, fingerprint=FINGERPRINT):
     set_seed(cfg.seed)
     model = build_model(cfg.require_model(), cfg.data)
@@ -134,6 +151,32 @@ def test_stalled_loader_worker_raises(tmp_path, monkeypatch):
     trainer = _trainer(_cfg(num_workers=1), tmp_path, StalledTracks(32))
     with pytest.raises(RuntimeError, match="timed out"):
         trainer.fit(1)
+
+
+def test_multimodal_training_monitors_its_modes(tmp_path):
+    trainer = _trainer(_multimodal_cfg(epochs=3), tmp_path, LinearTracks(128))
+    best = trainer.fit(3)
+    assert trainer.metrics()["best_metric"] == "val_min_ade"
+    assert best["val_min_ade"] == min(r["val_min_ade"] for r in trainer.history)
+    for record in trainer.history:
+        assert record["val_min_ade"] <= record["val_ade"]
+        rates = record["val_win_rates"]
+        assert len(rates) == 3 and sum(rates) == pytest.approx(1)
+        assert record["val_endpoint_spread_m"] > 0 and 0 < record["val_mode_entropy"] < 1.1
+        assert 0 <= record["val_top1_accuracy"] <= 1 and record["val_winner_nll"] > 0
+        assert record["collapsed_modes"] == [] or record["epoch"] >= 3
+    assert trainer.history[0]["train_loss"] > trainer.history[-1]["train_loss"]
+
+
+def test_mode_collapse_is_flagged_after_the_check_epoch(tmp_path):
+    """No mode can win 90% of the samples while every other mode does too, so from the check
+    epoch on every mode is flagged."""
+    cfg = _multimodal_cfg(collapse_min_win_rate=0.9, collapse_check_after_epochs=2)
+    trainer = _trainer(cfg, tmp_path, LinearTracks(64))
+    trainer.fit(2)
+    assert trainer.history[0]["collapsed_modes"] == []
+    assert trainer.history[1]["collapsed_modes"] == [0, 1, 2]
+    assert "mode collapse: modes [0, 1, 2]" in (tmp_path / "train.log").read_text()
 
 
 def test_nonfinite_loss_aborts_and_dumps_batch(tmp_path):

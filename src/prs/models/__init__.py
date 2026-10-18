@@ -37,7 +37,7 @@ def build_model(model_cfg: ModelConfig, data_cfg: DataConfig) -> ForecastModel:
             map_point_dim=model_cfg.map_point_dim,
             map_attention_heads=model_cfg.map_attention_heads,
         )
-    if model_cfg.name == "interaction":
+    if model_cfg.name in ("interaction", "multimodal"):
         return InteractionForecaster(
             agent_features=F_AGENT,
             map_features=F_MAP,
@@ -54,18 +54,19 @@ def build_model(model_cfg: ModelConfig, data_cfg: DataConfig) -> ForecastModel:
             transformer_heads=model_cfg.transformer_heads,
             transformer_ff_dim=model_cfg.transformer_ff_dim,
             map_point_dim=model_cfg.map_point_dim,
+            num_modes=model_cfg.num_modes or 1,
         )
     raise ValueError(f"unknown model {model_cfg.name!r}")
 
 
 def model_label(model_cfg: ModelConfig) -> str:
-    """The model's name in tables and figures. Interaction variants (one architecture, design
-    doc §19) also name the context they use."""
-    if model_cfg.name != "interaction":
+    """The model's name in tables and figures. Interaction and multimodal variants (one
+    architecture, design doc §19) also name the context they use."""
+    if model_cfg.name not in ("interaction", "multimodal"):
         return model_cfg.name
     context = [name for name, used in (("map", model_cfg.use_map),
                                        ("neighbors", model_cfg.use_neighbors)) if used]  # fmt: skip
-    return f"interaction ({' + '.join(context) or 'history only'})"
+    return f"{model_cfg.name} ({' + '.join(context) or 'history only'})"
 
 
 def is_learned(model: ForecastModel) -> bool:

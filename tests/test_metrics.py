@@ -1,6 +1,7 @@
 """Displacement metrics, miss rate, breakdowns, intervals, manifests and tables (§16, §21, §24)."""
 
 import json
+import math
 from pathlib import Path
 
 import numpy as np
@@ -16,6 +17,14 @@ from prs.metrics.breakdowns import (
 )
 from prs.metrics.displacement import ade, displacement_errors, fde
 from prs.metrics.manifest import manifest_hash, save_manifest
+from prs.metrics.multimodal import (
+    calibration,
+    endpoint_spread,
+    mode_entropy,
+    mode_probabilities,
+    mode_statistics,
+    ranking,
+)
 from prs.metrics.paired import align, paired_comparison, paired_table
 from prs.metrics.tables import ManifestMismatchError, breakdown_table, main_table
 from prs.utils.config import EvaluationConfig
@@ -235,3 +244,57 @@ def test_align_reorders_and_refuses_different_samples():
     np.testing.assert_array_equal(aligned["fde"], a["fde"])
     with pytest.raises(ValueError, match="different sample sets"):
         align(a, {name: values[:-1] for name, values in a.items()})
+
+
+def test_mode_entropy_bounds():
+    k = 6
+    assert mode_entropy(np.zeros((1, k)))[0] == pytest.approx(math.log(k))  # all equally likely
+    assert mode_entropy(np.array([[50.0, 0, 0, 0, 0, 0]]))[0] == pytest.approx(0.0, abs=1e-12)
+    np.testing.assert_allclose(mode_probabilities(np.array([[0.0, math.log(3)]])), [[0.25, 0.75]])
+
+
+def test_endpoint_spread_known_value():
+    modes = np.zeros((1, 3, 5, 2))
+    modes[0, 1, -1] = [3.0, 0.0]
+    modes[0, 2, -1] = [0.0, 4.0]  # pairwise endpoint distances 3, 4 and 5
+    assert endpoint_spread(modes)[0] == pytest.approx(4.0)
+    assert endpoint_spread(np.repeat(modes[:, :1], 3, axis=1))[0] == 0.0  # collapsed modes
+
+
+def test_win_rates_count_the_closest_mode():
+    future = np.zeros((4, 5, 2))
+    modes = np.ones((4, 3, 5, 2))
+    modes[[0, 1, 2], [0, 0, 2]] = 0.0  # mode 0 wins twice, mode 2 once; sample 3 ties -> mode 0
+    stats = mode_statistics(modes, np.zeros((4, 3)), future, np.ones((4, 5), bool), "ade")
+    assert stats["win_rates"] == [0.75, 0.0, 0.25]
+    assert stats["entropy"] == pytest.approx(math.log(3))
+
+
+def test_ranking_scores_the_winner_probability():
+    logits = np.log(np.array([[0.2, 0.5, 0.3], [0.2, 0.5, 0.3]]))
+    ranked = ranking(logits, np.array([1, 2]))  # the top mode wins once, the second mode once
+    assert ranked["top1_hit"].tolist() == [True, False]
+    np.testing.assert_allclose(ranked["winner_probability"], [0.5, 0.3])
+    np.testing.assert_allclose(ranked["winner_nll"], -np.log([0.5, 0.3]))
+    np.testing.assert_allclose(ranked["top1_confidence"], [0.5, 0.5])
+
+
+def test_calibration_error():
+    confidence = np.full(10, 0.9)
+    error, table = calibration(confidence, np.arange(10) < 5)  # 90% stated, 50% right
+    assert error == pytest.approx(0.4) and table == [
+        {"count": 10, "confidence": pytest.approx(0.9), "accuracy": 0.5}
+    ]
+    hit = np.r_[np.ones(3), np.zeros(7)].astype(bool)
+    assert calibration(np.full(10, 0.3), hit)[0] == pytest.approx(0.0)  # taken at face value
+
+
+def test_uniform_probabilities_score_log_k():
+    modes = np.random.default_rng(0).normal(size=(8, 6, 5, 2))
+    stats = mode_statistics(
+        modes, np.zeros((8, 6)), np.zeros((8, 5, 2)), np.ones((8, 5), bool), "ade",
+        clusters=np.arange(8),
+    )  # fmt: skip
+    assert stats["winner_nll"] == pytest.approx(math.log(6)) == stats["uniform_nll"]
+    assert stats["top1_confidence"] == pytest.approx(1 / 6)
+    assert stats["winner_nll_ci95"] == pytest.approx(0.0)
