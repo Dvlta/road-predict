@@ -10,6 +10,7 @@ sample builder itself:
 
 from __future__ import annotations
 
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
 import numpy as np
@@ -26,6 +27,7 @@ from prs.utils.config import DataConfig
 from prs.visualization.bev import (
     AGENT_COLORS,
     CHUNK_STYLES,
+    CONFLICT_COLOR,
     MUTED_COLOR,
     POLYGON_STYLES,
     SDC_COLOR,
@@ -47,8 +49,12 @@ def render_sample(
     predictions: np.ndarray | None = None,
     probabilities: np.ndarray | None = None,
     subtitle: str | None = None,
+    highlighted_modes: Sequence[int] = (),
+    overlay: Callable[[Axes], list] | None = None,
 ) -> None:
-    """Save a BEV figure. `predictions` is [K, T, 2] in the target frame."""
+    """Save a BEV figure. `predictions` is [K, T, 2] in the target frame; `highlighted_modes`
+    are drawn in the conflict color. `overlay(ax)` draws extra layers and returns their legend
+    handles."""
     meta = sample.meta
     window = make_window(cfg, meta.t0)
     model_view = sample.neighbors is not None and sample.map_polylines is not None
@@ -80,7 +86,10 @@ def render_sample(
              facecolor=TARGET_COLOR, edgecolor="black", lw=0.8, zorder=9)  # fmt: skip
 
     if predictions is not None:
-        _draw_predictions(ax, sample.target_history[-1, :2], predictions, probabilities)
+        draw_predictions(
+            ax, sample.target_history[-1, :2], predictions, probabilities, highlighted_modes
+        )
+    extra_handles = overlay(ax) if overlay is not None else []
 
     for direction, label in (((1, 0), "+x forward"), ((0, 1), "+y left")):
         tip = np.array(direction) * 3.0
@@ -119,8 +128,9 @@ def render_sample(
     if subtitle:
         lines.append(subtitle)
     ax.set_title("\n".join(lines), fontsize=10)
-    ax.legend(handles=_legend(predictions is not None, model_view), loc="upper left", fontsize=8,
-              framealpha=0.9)  # fmt: skip
+    handles = _legend(predictions is not None, model_view, bool(highlighted_modes))
+    ax.legend(handles=handles + extra_handles, loc="upper left", bbox_to_anchor=(1.02, 1.0),
+              borderaxespad=0.0, fontsize=8)  # fmt: skip
     out.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(out, dpi=130, bbox_inches="tight")
 
@@ -131,8 +141,7 @@ def _draw_raw_context(
     """Raw map and every agent valid at t0 within the neighbor radius (target-only samples)."""
     frame, t0, hist = sample.frame, window.t0, window.history_slice
     target_index = scenario.track_index(sample.meta.target_track_id)
-    for feature in scenario.map_features:
-        draw_map_feature(ax, feature.kind, frame.points_to_local(feature.points))
+    draw_sample_map(ax, scenario, sample)
     for i in range(scenario.num_tracks):
         if i in (target_index, scenario.sdc_index) or not scenario.valid[i, t0]:
             continue
@@ -155,11 +164,7 @@ def _draw_model_context(
     """What the model sees: selected chunks over the muted raw map, selected neighbors, and
     agents dropped by the neighbor cap."""
     frame, t0 = sample.frame, window.t0
-    for feature in scenario.map_features:
-        draw_map_feature(ax, feature.kind, frame.points_to_local(feature.points), muted=True)
-    for c in np.flatnonzero(sample.map_valid.any(axis=1)):
-        draw_map_chunk(ax, sample.map_types[c], sample.map_polylines[c, sample.map_valid[c], :2])
-
+    draw_sample_map(ax, scenario, sample)
     target_index = scenario.track_index(sample.meta.target_track_id)
     dropped = neighbor_candidates(scenario, target_index, cfg, t0)[cfg.max_neighbors :]
     for i in dropped:
@@ -178,24 +183,49 @@ def _draw_model_context(
                      zorder=5)  # fmt: skip
 
 
-def _draw_predictions(
-    ax, start: np.ndarray, predictions: np.ndarray, probabilities: np.ndarray | None
+def draw_sample_map(ax: Axes, scenario: RawScenario, sample: ProcessedSample) -> None:
+    """The map in the target frame: for complete samples, the model's map chunks over the
+    muted raw map; for target-only samples, the raw map."""
+    frame = sample.frame
+    model_view = sample.map_polylines is not None
+    for feature in scenario.map_features:
+        draw_map_feature(ax, feature.kind, frame.points_to_local(feature.points), muted=model_view)
+    if model_view:
+        for c in np.flatnonzero(sample.map_valid.any(axis=1)):
+            points = sample.map_polylines[c, sample.map_valid[c], :2]
+            draw_map_chunk(ax, sample.map_types[c], points)
+
+
+def draw_predictions(
+    ax: Axes,
+    start: np.ndarray,
+    predictions: np.ndarray,
+    probabilities: np.ndarray | None,
+    highlighted: Sequence[int] = (),
 ) -> None:
     """Predicted modes; more likely modes are more opaque and drawn on top."""
     num_modes = len(predictions)
     probs = np.full(num_modes, 1.0 / num_modes) if probabilities is None else probabilities
+    alphas = mode_alphas(probs)
     for k in np.argsort(probs):
-        alpha = 0.3 + 0.7 * probs[k] / probs.max()
+        alpha = alphas[k]
+        color = CONFLICT_COLOR if k in highlighted else PREDICTION_COLOR
         path = np.vstack([start, predictions[k]])
-        ax.plot(path[:, 0], path[:, 1], color=PREDICTION_COLOR, lw=2.0, ls=":", alpha=alpha,
+        ax.plot(path[:, 0], path[:, 1], color=color, lw=2.0, ls=":", alpha=alpha, zorder=8.5)
+        ax.plot(*predictions[k, -1], marker="x", color=color, ms=7, mew=2, alpha=alpha,
                 zorder=8.5)  # fmt: skip
-        ax.plot(*predictions[k, -1], marker="x", color=PREDICTION_COLOR, ms=7, mew=2,
-                alpha=alpha, zorder=8.5)  # fmt: skip
         if num_modes > 1:
             ax.text(*predictions[k, -1], f" {probs[k]:.2f}", fontsize=7, zorder=8.5)
 
 
-def _legend(with_predictions: bool, model_view: bool) -> list:
+def mode_alphas(probabilities: np.ndarray) -> np.ndarray:
+    """Line opacity per mode, rising with its probability: the most likely mode is opaque and
+    the least likely stays visible."""
+    probabilities = np.asarray(probabilities, dtype=np.float64)
+    return 0.3 + 0.7 * probabilities / probabilities.max()
+
+
+def _legend(with_predictions: bool, model_view: bool, with_conflicts: bool = False) -> list:
     handles = [
         Line2D([], [], color=TARGET_COLOR, lw=2.2, marker="o", ms=3, label="target history"),
         Line2D([], [], color=TARGET_COLOR, lw=2.0, ls="--", label="target future (GT)"),
@@ -203,6 +233,9 @@ def _legend(with_predictions: bool, model_view: bool) -> list:
     if with_predictions:
         handles.append(Line2D([], [], color=PREDICTION_COLOR, lw=2.0, ls=":", marker="x",
                               label="prediction"))  # fmt: skip
+    if with_conflicts:
+        handles.append(Line2D([], [], color=CONFLICT_COLOR, lw=2.0, ls=":", marker="x",
+                              label="prediction that conflicts"))  # fmt: skip
     handles += [
         Line2D([], [], color=SDC_COLOR, lw=2.0, label="SDC history"),
         Line2D([], [], color=SDC_COLOR, lw=2.0, ls="--", label="SDC future"),

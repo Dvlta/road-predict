@@ -45,6 +45,9 @@ MULTIMODAL_TRAINING_PARAMS = (
     "lambda_cls", "wta_selection", "collapse_min_win_rate", "collapse_check_after_epochs"
 )  # fmt: skip
 WTA_SELECTIONS = ("ade", "fde")
+# How the separation between a VRU and the ego is measured (design doc §22.3); `point` is
+# center-to-center and kept only for comparison.
+DISTANCE_MODES = ("ego_box", "point")
 DEVICES = ("auto", "cuda", "mps", "cpu")
 SPLIT_NAMES = ("train", "val", "test")
 # Official source split each project split must come from (design doc §10.2).
@@ -285,6 +288,28 @@ class EvaluationConfig:
 
 
 @dataclass(frozen=True)
+class RiskConfig:
+    """Conflict analysis (design doc §22). Project-level heuristics, not safety thresholds."""
+
+    distance_mode: str
+    vru_radius_m: float
+    conflict_distance_m: float
+    max_time_to_closest_approach_s: float
+    min_ego_speed_mps: float
+    max_sdc_distance_m: float  # only targets this close to the SDC at t0 are analyzed
+
+    def __post_init__(self) -> None:
+        _require(
+            self.distance_mode in DISTANCE_MODES,
+            f"risk.distance_mode must be one of {DISTANCE_MODES}",
+        )
+        for name in ("vru_radius_m", "min_ego_speed_mps"):
+            _require(getattr(self, name) >= 0, f"risk.{name} must be >= 0")
+        for name in ("conflict_distance_m", "max_time_to_closest_approach_s", "max_sdc_distance_m"):
+            _require(getattr(self, name) > 0, f"risk.{name} must be positive")
+
+
+@dataclass(frozen=True)
 class Config:
     data: DataConfig
     seed: int = 42
@@ -292,6 +317,7 @@ class Config:
     model: ModelConfig | None = None
     training: TrainingConfig | None = None
     evaluation: EvaluationConfig | None = None
+    risk: RiskConfig | None = None
     data_source: Path | None = None  # file the `data` section came from (names the data tier)
 
     def __post_init__(self) -> None:
@@ -327,6 +353,11 @@ class Config:
             raise ConfigError("config has no `evaluation` section")
         return self.evaluation
 
+    def require_risk(self) -> RiskConfig:
+        if self.risk is None:
+            raise ConfigError("config has no `risk` section")
+        return self.risk
+
 
 def load_config(path: str | Path, data_config: str | Path | None = None) -> Config:
     """Load a config. `data_config: <file>` pulls the `data` section from another config,
@@ -351,7 +382,7 @@ def load_config(path: str | Path, data_config: str | Path | None = None) -> Conf
 
 
 def config_from_dict(raw: dict[str, Any]) -> Config:
-    allowed = {"data", "seed", "device", "model", "training", "evaluation"}
+    allowed = {"data", "seed", "device", "model", "training", "evaluation", "risk"}
     _check_keys(raw, allowed, required={"data"}, where="config")
     return Config(
         data=data_config_from_dict(raw["data"]),
@@ -383,6 +414,19 @@ def config_from_dict(raw: dict[str, Any]) -> Config:
             EvaluationConfig,
             {"miss_threshold_m": _as_float, "stationary_speed_threshold_mps": _as_float},
         ),
+        risk=_section(
+            raw,
+            "risk",
+            RiskConfig,
+            {
+                "distance_mode": _as_str,
+                "vru_radius_m": _as_float,
+                "conflict_distance_m": _as_float,
+                "max_time_to_closest_approach_s": _as_float,
+                "min_ego_speed_mps": _as_float,
+                "max_sdc_distance_m": _as_float,
+            },
+        ),
     )
 
 
@@ -406,7 +450,7 @@ def config_to_dict(cfg: Config) -> dict[str, Any]:
         return {k: plain(v) for k, v in items.items() if v is not None}
 
     out: dict[str, Any] = {"seed": cfg.seed, "device": cfg.device, "data": section(cfg.data)}
-    for name in ("model", "training", "evaluation"):
+    for name in ("model", "training", "evaluation", "risk"):
         if getattr(cfg, name) is not None:
             out[name] = section(getattr(cfg, name))
     return out

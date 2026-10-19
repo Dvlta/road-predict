@@ -10,7 +10,9 @@ Reads samples from the processed cache (build it with scripts/preprocess_waymo.p
 outputs/metrics/<config name>/<data tier>/<split>.json, which records the exact sample set
 (manifest hash; the key list is saved under outputs/manifests/), the data fingerprint, the git
 commit and the checkpoint, so results are reproducible. Per-sample errors go to
-<split>.per_sample.npz beside it, for paired comparisons (scripts/compare_models.py).
+<split>.per_sample.npz beside it, for paired comparisons (scripts/compare_models.py), and the
+predictions themselves to <split>.predictions.npz, for conflict analysis
+(scripts/evaluate_conflicts.py).
 
 --shuffle-map SEED gives every sample another sample's map (design doc §14.3 check 6) and writes
 <split>_shuffled_map.json instead; compare it with the normal file to see how much the model
@@ -137,6 +139,7 @@ def main() -> None:
     shards = [p.name for p in shard_paths(cfg.data, args.split)]
     out = args.out_dir / args.config.stem / cfg.tier / f"{stem}.json"
     per_sample_path = out.with_name(f"{stem}.per_sample.npz")
+    predictions_path = out.with_name(f"{stem}.predictions.npz")
     shuffled = args.shuffle_map is not None
     report = {
         "model": model_label(model_cfg) + (" (shuffled map)" if shuffled else ""),
@@ -167,6 +170,7 @@ def main() -> None:
         **metrics,
         "filter_counts": dataset.filter_counts(),
         "per_sample": str(per_sample_path),
+        "predictions": str(predictions_path),
     }
     ranked = {}
     if model.num_modes > 1:  # collapse monitors and ranking (design doc §20, §21)
@@ -189,6 +193,12 @@ def main() -> None:
         current_speed_mps=speeds,
         **{name: per_sample[name] for name in ("ade", "fde", "min_ade", "min_fde")},
         **{name: ranked[name] for name in ("top1_hit", "winner_nll") if name in ranked},
+    )
+    np.savez_compressed(
+        predictions_path,
+        keys=np.array([sample_key(m) for m in metas]),
+        trajectories=results["trajectories"].astype(np.float32),
+        logits=results["logits"].astype(np.float32),
     )
     out.write_text(json.dumps(report, indent=2))
     print_report(report)

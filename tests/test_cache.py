@@ -109,6 +109,17 @@ def test_dataset_reads_selected_fields(cfg, samples):
         CachedDataset(cfg, "val", fields=("target_futures",))
 
 
+def test_dataset_column_reads_a_field_for_every_sample(cfg, samples):
+    for path in shard_paths(cfg, "val"):
+        _write(cfg, samples, path.name)
+    dataset = CachedDataset(cfg, "val", fields=())
+    np.testing.assert_array_equal(
+        dataset.column("ego_future"), np.stack([s.ego_future for s in samples])
+    )
+    with pytest.raises(ValueError, match="unknown sample field"):
+        dataset.column("ego_futures")
+
+
 def test_dataset_pickles_without_array_data(cfg, samples):
     """DataLoader workers receive a pickled dataset; memory maps must not travel with it."""
     for path in shard_paths(cfg, "val"):

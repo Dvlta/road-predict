@@ -46,6 +46,12 @@ class CachedDataset(Dataset):
     def metas(self) -> list[SampleMeta]:
         return [meta for shard in self.shards for meta in shard.metas()]
 
+    def column(self, name: str) -> np.ndarray:
+        """One field for every sample, in dataset order, read into memory."""
+        if name not in CACHE_FIELDS:
+            raise ValueError(f"unknown sample field {name!r}")
+        return np.concatenate([np.asarray(shard.array(name)) for shard in self.shards])
+
     def filter_counts(self) -> dict[str, dict[str, int]]:
         """Target-filter outcomes summed over the split's shards."""
         total: dict[str, dict[str, int]] = {}

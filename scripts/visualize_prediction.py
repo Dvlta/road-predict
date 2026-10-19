@@ -4,7 +4,10 @@
     uv run python scripts/visualize_prediction.py --config configs/baseline_cv.yaml \
         --scenario-id <id> --target-track-id <id>
     uv run python scripts/visualize_prediction.py --config configs/lstm.yaml \
-        --checkpoint outputs/runs/<run>/best.pt --examples 2
+        --checkpoint outputs/runs/<run>/best.pt --examples 2 --animate
+
+--animate also writes each example as a GIF: the history, then the forecast against the logged
+future.
 """
 
 from __future__ import annotations
@@ -24,6 +27,7 @@ from prs.models.base import model_inputs
 from prs.training.checkpoint import load_checkpoint, restore_model
 from prs.utils.config import SPLIT_NAMES, config_to_dict, load_config
 from prs.utils.fingerprint import data_fingerprint
+from prs.visualization.animation import render_animation
 from prs.visualization.predictions import render_sample
 
 
@@ -37,6 +41,7 @@ def main() -> None:
     parser.add_argument("--min-speed", type=float, default=0.0, help="m/s, examples mode only")
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/figures/predictions"))
     parser.add_argument("--checkpoint", type=Path, help="weights for a learned model")
+    parser.add_argument("--animate", action="store_true", help="also write a GIF per example")
     args = parser.parse_args()
     if (args.scenario_id is None) != (args.target_track_id is None):
         parser.error("--scenario-id and --target-track-id must be given together")
@@ -66,6 +71,14 @@ def main() -> None:
             trajectories, logits, batch["target_future"], batch["target_future_valid"]
         )
         ade, fde = float(metrics["ade"][0]), float(metrics["fde"][0])
+        subtitle = f"{model_label(model_cfg)} · ADE {ade:.2f} m · FDE {fde:.2f} m"
+        num_modes = trajectories.shape[1]
+        if num_modes > 1:
+            subtitle += (
+                f" (top mode) · minADE@{num_modes} {float(metrics['min_ade'][0]):.2f} m · "
+                f"minFDE@{num_modes} {float(metrics['min_fde'][0]):.2f} m"
+            )
+        probabilities = torch.softmax(output["logits"], dim=-1).numpy()[0]
         meta = sample.meta
         out = args.out_dir / args.config.stem / f"{meta.scenario_id}_{meta.target_track_id}.png"
         render_sample(
@@ -74,9 +87,18 @@ def main() -> None:
             cfg.data,
             out,
             predictions=trajectories[0],
-            probabilities=torch.softmax(output["logits"], dim=-1).numpy()[0],
-            subtitle=f"{model_label(model_cfg)} · ADE {ade:.2f} m · FDE {fde:.2f} m",
+            probabilities=probabilities,
+            subtitle=subtitle,
         )
+        if args.animate:
+            title = (
+                f"{ObjectType(meta.target_type).name.lower()} track {meta.target_track_id} · "
+                f"scenario {meta.scenario_id}\n{subtitle}"
+            )
+            render_animation(
+                scenario, sample, cfg.data, out.with_suffix(".gif"), trajectories[0],
+                probabilities, title,
+            )  # fmt: skip
         print(
             f"{ObjectType(meta.target_type).name.lower():<10} scenario {meta.scenario_id} "
             f"track {meta.target_track_id:<5} ADE {ade:5.2f} m  FDE {fde:5.2f} m  -> {out}"

@@ -11,6 +11,7 @@ from prs.data import PREPROCESS_VERSION
 from prs.utils.config import (
     MULTIMODAL_TRAINING_PARAMS,
     ConfigError,
+    RiskConfig,
     config_from_dict,
     config_to_dict,
     data_config_from_dict,
@@ -270,6 +271,40 @@ def test_multimodal_settings_are_checked(tmp_path, raw_data):
     ):
         with pytest.raises(ConfigError, match=message):
             load(model_section, training_section)
+
+
+def test_model_configs_share_one_conflict_rule():
+    paths = [p for p in sorted(DEV_CONFIG.parent.glob("*.yaml")) if not p.stem.startswith("data_")]
+    rules = {load_config(path).require_risk() for path in paths}
+    assert rules == {RiskConfig("ego_box", 0.4, 3.0, 4.0, 1.0, 50.0)}  # doc §13, 3 m: §22.6
+    with pytest.raises(ConfigError, match="no `risk` section"):
+        load_config(DEV_CONFIG).require_risk()
+
+
+def test_risk_settings_are_checked(tmp_path, raw_data):
+    path = tmp_path / "risk.yaml"
+    risk = {"distance_mode": "ego_box", "vru_radius_m": 0.4, "conflict_distance_m": 1.0,
+            "max_time_to_closest_approach_s": 4.0, "min_ego_speed_mps": 1.0,
+            "max_sdc_distance_m": 50.0}  # fmt: skip
+
+    def load(section):
+        path.write_text(yaml.safe_dump({"data": raw_data, "risk": section}))
+        return load_config(path)
+
+    assert load({**risk, "distance_mode": "point"}).require_risk().distance_mode == "point"
+    assert load({**risk, "vru_radius_m": 0}).require_risk().vru_radius_m == 0.0
+    for section, message in (
+        ({**risk, "distance_mode": "circle"}, "distance_mode must be one of"),
+        ({**risk, "vru_radius_m": -0.1}, "vru_radius_m must be >= 0"),
+        ({**risk, "min_ego_speed_mps": -1}, "min_ego_speed_mps must be >= 0"),
+        ({**risk, "conflict_distance_m": 0}, "conflict_distance_m must be positive"),
+        ({**risk, "max_time_to_closest_approach_s": 0}, "must be positive"),
+        ({**risk, "max_sdc_distance_m": -5}, "max_sdc_distance_m must be positive"),
+        ({k: v for k, v in risk.items() if k != "vru_radius_m"}, "missing keys"),
+        ({**risk, "radius": 1}, "unknown keys"),
+    ):
+        with pytest.raises(ConfigError, match=message):
+            load(section)
 
 
 def test_config_rejects_unknown_device(tmp_path, raw_data):

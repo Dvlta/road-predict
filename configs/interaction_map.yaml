@@ -29,3 +29,11 @@ training:
 evaluation:
   miss_threshold_m: 2.0
   stationary_speed_threshold_mps: 0.5
+
+risk:  # conflict analysis (design doc §22); project heuristics, not safety thresholds
+  distance_mode: ego_box  # ego_box | point (center-to-center, for comparison only)
+  vru_radius_m: 0.4
+  conflict_distance_m: 3.0  # not the design doc's 1.0, which left 7 test conflicts to score
+  max_time_to_closest_approach_s: 4.0
+  min_ego_speed_mps: 1.0
+  max_sdc_distance_m: 50.0  # analyze only targets this close to the SDC at t0
