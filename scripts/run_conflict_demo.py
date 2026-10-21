@@ -16,6 +16,12 @@ a mix of caught conflicts, false alarms and missed conflicts. Otherwise it draws
 sample of the analyzed targets. --animate also writes each example as a GIF that plays the
 history, the forecast and the logged future (prs.visualization.animation).
 
+--plan no_yield replaces the SDC's logged future with a synthetic plan that does not yield to
+people but stops for other vehicles (prs.risk.counterfactual; reading the vehicles from the raw
+shards adds a minute or two) and draws synthetic crashes instead: the logged VRU future touching
+the plan's footprint, scored by the contact score. The logged SDC future is drawn in gray.
+Figures go to a `_no_yield` folder.
+
 Figures go to outputs/figures/conflicts/<config>/<tier>_<split>/, named by outcome and score.
 The map comes from the raw shards, so the split's raw shards must be present.
 """
@@ -23,9 +29,11 @@ The map comes from the raw shards, so the split's raw shards must be present.
 from __future__ import annotations
 
 import argparse
+import dataclasses
 from pathlib import Path
 
 import numpy as np
+from matplotlib.lines import Line2D
 from torch.utils.data import DataLoader
 
 from prs.data import PREPROCESS_VERSION
@@ -37,6 +45,13 @@ from prs.data.windows import make_window
 from prs.metrics.multimodal import mode_probabilities
 from prs.models import build_model, is_learned, model_label
 from prs.risk.conflict import analyze_conflict, mode_conflicts
+from prs.risk.counterfactual import (
+    CONTACT_DISTANCE_M,
+    EGO_PLAN_FIELDS,
+    NO_YIELD_ACCEL_MPS2,
+    contact_rule,
+    split_no_yield_plans,
+)
 from prs.risk.evaluation import (
     SCORE_THRESHOLD,
     analyzed,
@@ -49,12 +64,24 @@ from prs.training.inference import predict
 from prs.utils.config import DEVICES, SPLIT_NAMES, config_to_dict, load_config
 from prs.utils.fingerprint import data_fingerprint
 from prs.visualization.animation import render_animation
-from prs.visualization.bev import CONFLICT_COLOR, SDC_COLOR, TARGET_COLOR
+from prs.visualization.bev import (
+    CONFLICT_COLOR,
+    LOGGED_COLOR,
+    SDC_COLOR,
+    TARGET_COLOR,
+    draw_trajectory,
+)
 from prs.visualization.conflict import ClosestApproach, draw_closest_approach, draw_time_ticks
 from prs.visualization.predictions import PREDICTION_COLOR, render_sample
 
 EGO_FIELDS = ("ego_future", "ego_future_valid", "ego_size")
+PLANS = ("logged", "no_yield")
+PLAN_FIELDS = (*EGO_PLAN_FIELDS, "origin_global", "heading_global")
 OUTCOMES = ("caught", "false_alarm", "missed")  # the --only-conflicts mix, in turn
+
+
+def gap_text(separation: float) -> str:
+    return "contact" if separation < CONTACT_DISTANCE_M else f"{separation:.1f} m"
 
 
 def outcome(conflict: bool, flagged: bool) -> str:
@@ -104,6 +131,11 @@ def main() -> None:
     parser.add_argument("--target-track-id", type=int)
     parser.add_argument("--threshold", type=float, default=SCORE_THRESHOLD)
     parser.add_argument("--animate", action="store_true", help="also write a GIF per example")
+    parser.add_argument(
+        "--plan", choices=PLANS, default="logged",
+        help="the SDC's logged future, or a synthetic plan that does not yield (crashes)",
+    )  # fmt: skip
+    parser.add_argument("--accel", type=float, default=NO_YIELD_ACCEL_MPS2, help="no_yield, m/s^2")
     parser.add_argument("--seed", type=int, default=0, help="which examples are drawn")
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--device", choices=DEVICES, help="override the config's device")
@@ -130,16 +162,23 @@ def main() -> None:
     results = predict(model, loader, device)
     metas = dataset.metas()
     ego_future, ego_valid, ego_size = (dataset.column(name) for name in EGO_FIELDS)
-    future, future_valid = results["target_future"], results["target_future_valid"]
-    labels = ground_truth_conflicts(future, future_valid, ego_future, ego_valid, ego_size, risk, dt)
-    scores = predicted_conflict_scores(
-        results["trajectories"], results["logits"], ego_future, ego_valid, ego_size, risk, dt
-    )
+    counterfactual = args.plan == "no_yield"
+    rule, events = risk, "conflicts"
     inside = analyzed(np.array([m.sdc_distance_m for m in metas]), risk)
+    if counterfactual:
+        columns = {name: dataset.column(name) for name in PLAN_FIELDS}
+        plans = split_no_yield_plans(cfg.data, args.split, metas, columns, dt, [args.accel], inside)
+        ego_future, ego_valid, extended, _ = plans[args.accel]
+        rule, events = contact_rule(risk, cfg.data.future_seconds), "synthetic crashes"
+    future, future_valid = results["target_future"], results["target_future_valid"]
+    labels = ground_truth_conflicts(future, future_valid, ego_future, ego_valid, ego_size, rule, dt)
+    scores = predicted_conflict_scores(
+        results["trajectories"], results["logits"], ego_future, ego_valid, ego_size, rule, dt
+    )
     flagged = scores >= args.threshold
     print(
         f"{int(inside.sum())} of {len(metas)} targets analyzed: "
-        f"{int((inside & labels & flagged).sum())} conflicts caught, "
+        f"{int((inside & labels & flagged).sum())} {events} caught, "
         f"{int((inside & labels & ~flagged).sum())} missed, "
         f"{int((inside & ~labels & flagged).sum())} false alarms"
     )
@@ -165,6 +204,8 @@ def main() -> None:
             scenarios[scenario.scenario_id] = scenario
 
     out_dir = args.out_dir / args.config.stem / f"{cfg.tier}_{args.split}"
+    if counterfactual:
+        out_dir = out_dir.with_name(f"{out_dir.name}_no_yield")
     for i in chosen:
         meta = metas[i]
         scenario = scenarios[meta.scenario_id]
@@ -173,20 +214,25 @@ def main() -> None:
         sample = build_sample(scenario, index, cfg.data, window, meta.shard)
         if not np.allclose(sample.target_future, future[i], atol=1e-4):
             raise RuntimeError(f"raw and cached samples differ for {meta.scenario_id}")
+        logged_future, logged_valid = sample.ego_future, sample.ego_future_valid
+        if counterfactual:
+            sample = dataclasses.replace(
+                sample, ego_future=ego_future[i].astype(np.float32), ego_future_valid=ego_valid[i]
+            )
         predictions = results["trajectories"][i]
         probabilities = mode_probabilities(results["logits"][i : i + 1])[0]
         result = analyze_conflict(
             predictions, probabilities, sample.ego_future, sample.ego_future_valid,
-            sample.ego_size, risk, dt,
+            sample.ego_size, rule, dt,
         )  # fmt: skip
         modes = mode_conflicts(
             predictions[None], sample.ego_future[None], sample.ego_future_valid[None],
-            sample.ego_size[None], risk, dt,
+            sample.ego_size[None], rule, dt,
         )  # fmt: skip
         truth = mode_conflicts(
             sample.target_future[None, None], sample.ego_future[None],
             (sample.target_future_valid & sample.ego_future_valid)[None],
-            sample.ego_size[None], risk, dt,
+            sample.ego_size[None], rule, dt,
         )  # fmt: skip
         k = result.highest_risk_mode
         risky_color = CONFLICT_COLOR if result.conflicting_modes else PREDICTION_COLOR
@@ -196,7 +242,7 @@ def main() -> None:
             closest = int(modes["closest_index"][0, k])
             approaches.append(ClosestApproach(
                 closest, predictions[k, closest],
-                f"mode {k}: {result.min_separation_m:.1f} m at "
+                f"mode {k}: {gap_text(result.min_separation_m)} at "
                 f"{result.time_to_closest_approach_s:.1f} s",
                 risky_color, "SDC at the predicted closest approach", text_offset=(8, 10),
             ))  # fmt: skip
@@ -204,32 +250,56 @@ def main() -> None:
             closest = int(truth["closest_index"][0, 0])
             approaches.append(ClosestApproach(
                 closest, sample.target_future[closest],
-                f"truth: {truth['min_separation_m'][0, 0]:.1f} m at "
+                f"truth: {gap_text(truth['min_separation_m'][0, 0])} at "
                 f"{truth['time_to_closest_s'][0, 0]:.1f} s",
                 TARGET_COLOR, "SDC at the true closest approach",
             ))  # fmt: skip
 
         def overlay(ax, sample=sample, path=predictions[k], predicted=predicted,
-                    approaches=approaches, color=risky_color):  # fmt: skip
+                    approaches=approaches, color=risky_color,
+                    logged=(logged_future, logged_valid)):  # fmt: skip
+            handles = []
+            if counterfactual:
+                draw_trajectory(ax, logged[0][:, :2], logged[1], color=LOGGED_COLOR, lw=2.0,
+                                ls="--", zorder=5.5)  # fmt: skip
+                handles.append(Line2D([], [], color=LOGGED_COLOR, lw=2.0, ls="--",
+                                      label="SDC logged future"))  # fmt: skip
             draw_time_ticks(ax, sample.ego_future[:, :2], sample.ego_future_valid, dt, SDC_COLOR)
             if predicted:
                 draw_time_ticks(ax, path, np.ones(len(path), bool), dt, color)
-            return [
+            return handles + [
                 draw_closest_approach(ax, sample.ego_future, sample.ego_size, a) for a in approaches
             ]
 
         verdict = outcome(bool(labels[i]), bool(flagged[i]))
         conflicting = ", ".join(str(m) for m in result.conflicting_modes) or "none"
         true_speed = truth["ego_speed_mps"][0, 0]
+        if counterfactual:
+            contact_index = int(truth["closest_index"][0, 0])
+            where = " past the end of the logged path" if extended[i, contact_index] else ""
+            label = (
+                f"crash at {truth['time_to_closest_s'][0, 0]:.1f} s{where}" if labels[i]
+                else "no crash"
+            )  # fmt: skip
+            score_line = f"contact score {result.score:.2f} (modes touching the plan: "
+            rule_line = (
+                f"SYNTHETIC: the SDC drives its logged path without yielding "
+                f"({args.accel:g} m/s²); open loop, the person reacted to the real SDC"
+            )
+        else:
+            label = f"{'conflict' if labels[i] else 'no conflict'}"
+            score_line = f"conflict score {result.score:.2f} (conflicting modes: "
+            rule_line = (
+                f"rule: closer than {risk.conflict_distance_m:g} m to the SDC footprint within "
+                f"{risk.max_time_to_closest_approach_s:g} s, SDC moving >= "
+                f"{risk.min_ego_speed_mps:g} m/s"
+            )
         subtitle = "\n".join([
-            f"{model_label(model_cfg)} · conflict score {result.score:.2f} (conflicting modes: "
-            f"{conflicting}) · {'flagged' if flagged[i] else 'not flagged'} at "
-            f">= {args.threshold:g}",
-            f"ground truth: {'conflict' if labels[i] else 'no conflict'} (SDC at "
-            f"{true_speed:.1f} m/s then) · outcome: {verdict.replace('_', ' ')}",
-            f"rule: closer than {risk.conflict_distance_m:g} m to the SDC footprint within "
-            f"{risk.max_time_to_closest_approach_s:g} s, SDC moving >= "
-            f"{risk.min_ego_speed_mps:g} m/s",
+            f"{model_label(model_cfg)} · {score_line}{conflicting}) · "
+            f"{'flagged' if flagged[i] else 'not flagged'} at >= {args.threshold:g}",
+            f"ground truth: {label} (SDC at {true_speed:.1f} m/s then) · outcome: "
+            f"{verdict.replace('_', ' ')}",
+            rule_line,
         ])  # fmt: skip
         out = (
             out_dir / f"{verdict}_{result.score:.2f}_{meta.scenario_id}_{meta.target_track_id}.png"
@@ -241,17 +311,23 @@ def main() -> None:
         )  # fmt: skip
         if args.animate:
             target_type = ObjectType(meta.target_type).name.lower()
+            short_rule = (
+                f"SYNTHETIC: the SDC does not yield (its logged path, {args.accel:g} m/s²); "
+                "open loop"
+                if counterfactual
+                else rule_line
+            )
             title = "\n".join([
                 f"{target_type} track {meta.target_track_id} · scenario {meta.scenario_id}",
-                f"{model_label(model_cfg)} · conflict score {result.score:.2f} · ground truth: "
-                f"{'conflict' if labels[i] else 'no conflict'} · {verdict.replace('_', ' ')}",
-                f"conflict: closer than {risk.conflict_distance_m:g} m to the SDC footprint "
-                f"within {risk.max_time_to_closest_approach_s:g} s, SDC moving >= "
-                f"{risk.min_ego_speed_mps:g} m/s",
+                f"{model_label(model_cfg)} · {score_line.split(' (')[0]} · ground truth: "
+                f"{label.replace(' past the end of the logged path', '')} · "
+                f"{verdict.replace('_', ' ')}",
+                short_rule,
             ])  # fmt: skip
             render_animation(
                 scenario, sample, cfg.data, out.with_suffix(".gif"), predictions, probabilities,
                 title, result.conflicting_modes, approaches,
+                ego_plan=sample.ego_future if counterfactual else None,
             )  # fmt: skip
         print(
             f"{verdict:<12} score {result.score:.2f}  "

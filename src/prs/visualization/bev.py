@@ -22,6 +22,7 @@ AGENT_COLORS = {
 TARGET_COLOR = "#C44E52"
 SDC_COLOR = "#8172B3"
 CONFLICT_COLOR = "#E7298A"  # predicted modes that conflict with the ego
+LOGGED_COLOR = "#A9A9A9"  # the SDC's logged future beside a counterfactual plan
 
 LINE_STYLES = {
     "lane": dict(color="#B5B5B5", lw=0.7, ls=(0, (4, 3)), zorder=1),

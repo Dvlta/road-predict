@@ -24,11 +24,6 @@ from pathlib import Path
 
 import numpy as np
 
-from prs.data.dataset import CachedDataset
-from prs.data.types import OBJECT_TYPE_BY_NAME
-from prs.metrics.manifest import manifest_hash, sample_key
-from prs.metrics.paired import align
-from prs.metrics.tables import ManifestMismatchError, check_comparable
 from prs.risk.evaluation import (
     BOOTSTRAP_DRAWS,
     SCORE_THRESHOLD,
@@ -40,6 +35,7 @@ from prs.risk.evaluation import (
     precision_recall_curve,
     predicted_conflict_scores,
 )
+from prs.risk.inputs import load_scoring_inputs
 from prs.utils.config import DISTANCE_MODES, RiskConfig, load_config
 from prs.visualization.conflict import render_precision_recall
 
@@ -78,18 +74,11 @@ def main() -> None:
     parser.add_argument("--out-dir", type=Path, default=Path("outputs/conflicts"))
     args = parser.parse_args()
 
-    reports = [json.loads(path.read_text()) for path in args.metrics]
-    try:
-        check_comparable(reports)
-    except ManifestMismatchError as error:
-        raise SystemExit(f"error: {error}") from None
-    first = reports[0]
-    names = [r["model"] for r in reports]
-    if len(set(names)) != len(names):
-        raise SystemExit(f"error: two files hold the same model {names}")
     cfg = load_config(args.config, data_config=args.data_config)
-    if cfg.tier != first["tier"]:
-        raise SystemExit(f"error: the config uses tier {cfg.tier!r}, the metrics {first['tier']!r}")
+    try:
+        inputs = load_scoring_inputs(args.metrics, cfg)
+    except ValueError as error:
+        raise SystemExit(f"error: {error}") from None
     overrides = {
         "conflict_distance_m": args.conflict_distance_m,
         "max_time_to_closest_approach_s": args.max_time_s,
@@ -100,46 +89,32 @@ def main() -> None:
         cfg.require_risk(), **{k: v for k, v in overrides.items() if v is not None}
     )
 
-    split = first["split"]
-    dataset = CachedDataset(cfg.data, split, fields=[])
-    metas = dataset.metas()
-    keys = np.array([sample_key(m) for m in metas])
-    if manifest_hash(keys.tolist()) != first["manifest"]["sha256"]:
-        raise SystemExit("error: the cached split is not the sample set of the metrics files")
-    columns = {
-        name: dataset.column(name) for name in ("target_future", "target_future_valid", *EGO_FIELDS)
-    }
+    split, columns, names = inputs.split, inputs.columns, inputs.models
     ego = [columns[name] for name in EGO_FIELDS]
     labels = ground_truth_conflicts(
         columns["target_future"], columns["target_future_valid"], *ego, risk, cfg.data.dt
     )
-    scores = {}
-    for report in reports:
-        predictions = align({"keys": keys}, dict(np.load(report["predictions"])))
-        scores[report["model"]] = predicted_conflict_scores(
+    scores = {
+        name: predicted_conflict_scores(
             predictions["trajectories"], predictions["logits"], *ego, risk, cfg.data.dt
         )
-
-    inside = analyzed(np.array([m.sdc_distance_m for m in metas]), risk)
-    types = np.array([m.target_type for m in metas])
-    scenes = np.array([m.scenario_id for m in metas])
-    groups = {"overall": inside}
-    groups.update(
-        {name: inside & (types == OBJECT_TYPE_BY_NAME[name]) for name in cfg.data.target_types}
-    )
+        for name, predictions in inputs.predictions.items()
+    }
+    inside = analyzed(np.array([m.sdc_distance_m for m in inputs.metas]), risk)
+    groups = inputs.groups(inside, cfg.data.target_types)
     results = {
         group: compare_conflict_scores(
-            {name: s[mask] for name, s in scores.items()}, labels[mask], scenes[mask],
+            {name: s[mask] for name, s in scores.items()}, labels[mask], inputs.scenes[mask],
             args.threshold, args.draws,
         )
         for group, mask in groups.items()
     }  # fmt: skip
 
     stem = f"{split}_{rule_name(risk)}"
-    out = args.out_dir / first["tier"] / stem
+    out = args.out_dir / inputs.tier / stem
     overall = results["overall"][names[0]]
     header = (
-        f"Split `{split}` of tier `{first['tier']}`, manifest `{first['manifest']['sha256']}`: "
+        f"Split `{split}` of tier `{inputs.tier}`, manifest `{inputs.manifest['sha256']}`: "
         f"{int(inside.sum())} of {len(inside)} samples analyzed, {overall['positives']} "
         f"ground-truth conflicts. Conflict rule: {rule_text(risk)}. Flagged = "
         f"conflict_score >= {args.threshold:g}; precision and recall are at that threshold. "
@@ -154,14 +129,12 @@ def main() -> None:
         json.dumps(
             {
                 "split": split,
-                "tier": first["tier"],
-                "manifest": first["manifest"],
+                "tier": inputs.tier,
+                "manifest": inputs.manifest,
                 "risk": dataclasses.asdict(risk),
                 "threshold": args.threshold,
                 "bootstrap_draws": args.draws,
-                "metrics_files": {
-                    r["model"]: str(p) for r, p in zip(reports, args.metrics, strict=True)
-                },
+                "metrics_files": inputs.metrics_files,
                 "num_samples": len(inside),
                 "num_analyzed": int(inside.sum()),
                 "groups": results,

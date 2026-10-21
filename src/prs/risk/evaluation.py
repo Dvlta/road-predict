@@ -43,15 +43,33 @@ def ground_truth_conflicts(
     dt: float,
 ) -> np.ndarray:
     """Whether the logged target future conflicts with the logged ego future: bool [B]."""
-    labels = []
+    return ground_truth_approaches(
+        target_future, target_future_valid, ego_future, ego_future_valid, ego_size, risk, dt
+    )["conflict"]
+
+
+def ground_truth_approaches(
+    target_future: np.ndarray,
+    target_future_valid: np.ndarray,
+    ego_future: np.ndarray,
+    ego_future_valid: np.ndarray,
+    ego_size: np.ndarray,
+    risk: RiskConfig,
+    dt: float,
+) -> dict[str, np.ndarray]:
+    """`mode_conflicts` of the logged target future, one value per sample [B]: whether it
+    conflicts, and its closest approach (separation, index, time, ego speed). Frames where the
+    target or the ego is invalid are skipped."""
+    parts: dict[str, list[np.ndarray]] = {}
     for part in _chunks(len(target_future)):
         frame_valid = np.asarray(target_future_valid[part]) & np.asarray(ego_future_valid[part])
         modes = mode_conflicts(
             np.asarray(target_future[part])[:, None], ego_future[part], frame_valid,
             ego_size[part], risk, dt,
         )  # fmt: skip
-        labels.append(modes["conflict"][:, 0])
-    return np.concatenate(labels)
+        for name, values in modes.items():
+            parts.setdefault(name, []).append(values[:, 0])
+    return {name: np.concatenate(values) for name, values in parts.items()}
 
 
 def predicted_conflict_scores(
@@ -215,13 +233,13 @@ def compare_conflict_scores(
     return result
 
 
-def conflict_table(groups: dict[str, dict[str, dict]]) -> str:
+def conflict_table(groups: dict[str, dict[str, dict]], positives: str = "GT conflicts") -> str:
     """Markdown: one row per group and model, from `compare_conflict_scores` results keyed by
-    group. Intervals are 95% scene-bootstrap; `*` marks AP differences whose interval excludes
-    zero."""
+    group; `positives` heads the label count. Intervals are 95% scene-bootstrap; `*` marks AP
+    differences whose interval excludes zero."""
     reference = next(iter(next(iter(groups.values()))))
     lines = [
-        f"| Group | Model | n | GT conflicts | Base rate | AP | AP − {reference} "
+        f"| Group | Model | n | {positives} | Base rate | AP | AP − {reference} "
         "| Flagged | Precision | Recall |",
         "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|",
     ]

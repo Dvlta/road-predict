@@ -26,6 +26,7 @@ from prs.utils.config import DataConfig
 from prs.visualization.bev import (
     AGENT_COLORS,
     CONFLICT_COLOR,
+    LOGGED_COLOR,
     SDC_COLOR,
     TARGET_COLOR,
     box_corners,
@@ -57,10 +58,13 @@ def render_animation(
     title: str = "",
     highlighted_modes: Sequence[int] = (),
     approaches: Sequence[ClosestApproach] = (),
+    ego_plan: np.ndarray | None = None,
     dpi: int = 80,
 ) -> int:
     """Save a GIF and return its number of frames. `predictions` [K, T, 2], `probabilities`
-    and `highlighted_modes` are as for `render_sample`."""
+    and `highlighted_modes` are as for `render_sample`. With `ego_plan` (a counterfactual ego
+    future [T, 5] in the target frame, also the sample's `ego_future`), the SDC follows it
+    after t0 and its logged future is drawn faintly."""
     meta = sample.meta
     window = make_window(cfg, meta.t0)
     now = window.history_steps  # t0's position among the animated frames
@@ -70,6 +74,10 @@ def render_animation(
     heading = frame.headings_to_local(scenario.heading[:, frames])
     size, valid = scenario.size[:, frames], scenario.valid[:, frames]
     target, sdc = scenario.track_index(meta.target_track_id), scenario.sdc_index
+    logged_sdc = np.where(valid[sdc, now:, None], xy[sdc, now:], np.nan)
+    if ego_plan is not None:
+        xy[sdc, now + 1 :], heading[sdc, now + 1 :] = ego_plan[:, :2], ego_plan[:, 2]
+        valid[sdc, now + 1 :] = True
 
     shown = [
         sample.target_history[sample.target_history_valid, :2],
@@ -78,6 +86,9 @@ def render_animation(
     ]
     if predictions is not None:
         shown.append(predictions.reshape(-1, 2))
+    if approaches:  # frame the SDC's approach too
+        last = max(a.index for a in approaches) + 1
+        shown.append(sample.ego_future[:last, :2][sample.ego_future_valid[:last]])
     radius = float(np.clip(np.abs(np.concatenate(shown)).max() + 8.0, 15.0, cfg.map_radius_m))
 
     fig = Figure(figsize=(6.4, 7.6))
@@ -85,6 +96,8 @@ def render_animation(
     ax = fig.subplots()
     fig.subplots_adjust(left=0.1, right=0.97, top=0.88, bottom=0.2)
     draw_sample_map(ax, scenario, sample)
+    if ego_plan is not None:
+        ax.plot(*logged_sdc.T, color=LOGGED_COLOR, lw=2.0, ls="--", zorder=5.5)
     ax.set_xlim(-radius, radius)
     ax.set_ylim(-radius, radius)
     ax.set_aspect("equal")
@@ -119,8 +132,10 @@ def render_animation(
         for k, alpha in enumerate(mode_alphas(probs)):
             color = CONFLICT_COLOR if k in highlighted_modes else PREDICTION_COLOR
             dots += ax.plot([], [], "o", color=color, ms=5, alpha=alpha, zorder=8.6)
-    ax.legend(handles=_legend(predictions is not None, bool(highlighted_modes), approaches),
-              loc="upper center", bbox_to_anchor=(0.5, -0.07), ncol=3, fontsize=7)  # fmt: skip
+    handles = _legend(predictions is not None, bool(highlighted_modes), approaches,
+                      ego_plan is not None)  # fmt: skip
+    ax.legend(handles=handles, loc="upper center", bbox_to_anchor=(0.5, -0.07), ncol=3,
+              fontsize=7)  # fmt: skip
 
     def path(track: int, start: int, stop: int) -> np.ndarray:
         """Positions of frames start..stop (inclusive), NaN where invalid."""
@@ -188,13 +203,22 @@ def _quantize(images: list[Image.Image]) -> list[Image.Image]:
 
 
 def _legend(
-    with_predictions: bool, with_conflicts: bool, approaches: Sequence[ClosestApproach]
+    with_predictions: bool,
+    with_conflicts: bool,
+    approaches: Sequence[ClosestApproach],
+    counterfactual: bool = False,
 ) -> list:
     handles = [
         Line2D([], [], color=TARGET_COLOR, lw=2.2, marker="o", ms=3, label="target history"),
         Line2D([], [], color=TARGET_COLOR, lw=2.0, ls="--", label="target future (GT)"),
-        Line2D([], [], color=SDC_COLOR, lw=2.0, label="SDC (dashed: logged plan)"),
     ]
+    if counterfactual:
+        handles += [
+            Line2D([], [], color=SDC_COLOR, lw=2.0, ls="--", label="SDC counterfactual plan"),
+            Line2D([], [], color=LOGGED_COLOR, lw=2.0, ls="--", label="SDC logged future"),
+        ]
+    else:
+        handles.append(Line2D([], [], color=SDC_COLOR, lw=2.0, label="SDC (dashed: logged plan)"))
     if with_predictions:
         handles.append(Line2D([], [], color=PREDICTION_COLOR, lw=2.0, ls=":", marker="x",
                               label="prediction"))  # fmt: skip
